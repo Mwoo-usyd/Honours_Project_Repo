@@ -1,0 +1,4416 @@
+---
+title: "Notes"
+author: '500455892'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+```{r, message = FALSE, warning = FALSE}
+library(MASS)
+library(LassoSIR)
+library(mclust)
+library(uwot)
+library(ggiraph)
+library(patchwork)
+library(e1071)
+library(tidyverse)
+library(gt)
+source("utils.R") # testing using a .R file
+source("sir_functions.R") # the .R file with all the SIR-related functions
+```
+
+# Week 6 notes
+
+Book chapter 5 slice covariance to deal with even functions, as it breaks down there as E(X|Y) = 0 there.
+
+Keep in mind, don't worry about implement unless need
+
+
+Learn LASSO: generally and for SIR specifically (see paper)
+What is sparsity: books 
+How to deal with it for linear modelling 
+Book in slack: sections 6.1, 6.2 
+
+# Week 8 notes
+
+Apply to spatial omics data: will have x and y, multivariate: then slice into squares is obvious method. Do that in R
+
+Do Y as binary variable 
+
+If do R: ordinal Y, see how group categories
+
+Multivariate Y: how to sort and slice 
+
+
+
+Chunk to access (saved) data:
+
+```{r}
+exprs <- readRDS("seqFISH_exprs.Rds")
+coords <- readRDS("seqFISH_coords.Rds")
+meta <- readRDS("seqFish_meta.Rds")
+```
+
+
+# Data Organisation
+
+Making dataframes that are easier to use.
+
+genomic_data: gene expression (columns 1:351) and coordinates
+
+```{r, warning = FALSE}
+genomic_data <- matrix(NA, nrow = nrow(coords), ncol = ncol(coords) + ncol(exprs))
+  
+for (i in 1:nrow(coords)) {
+  genomic_data[i,] <- c(setNames(exprs[i,], NULL), setNames(coords[i,], NULL))
+}
+genomic_data <- genomic_data %>% as.data.frame()
+colnames(genomic_data) <- c(colnames(exprs), colnames(coords))
+rownames(genomic_data) <- rownames(exprs)
+
+mouse_x <- dplyr::select(genomic_data, colnames(genomic_data)[1:351])
+mouse_coords <- genomic_data %>% dplyr::select(c(x,y))
+mouse_celltype <- meta[,7] %>% as.data.frame()
+```
+
+## Create SIR Objects
+
+Performing dimension reduction on the genomic_data as described above, using the spatial coordinates as our "y". 
+
+mouse_sir: (spatial) SIR on genomic_data: customisable number of directions (10 used here).
+
+mouse_pca: dataframe with first 10 PCs after doing PCA on genomic_data
+
+```{r}
+mouse_sir <- spatial_sir(dataset = genomic_data, directions <- 10, x = "x", y = "y", x_slices = 10, y_slices = 10) # just run spatial SIR (this doesn't actually take long)
+
+genomic_pca <- prcomp(genomic_data[,-(352:353)])$x[,1:50] %>% as.data.frame() # run PCA to go from 351 columns to 50 directions
+genomic_pca$x <- genomic_data$x
+genomic_pca$y <- genomic_data$y
+mouse_pca_sir <- spatial_sir(dataset = genomic_pca, directions = 10, x = "x", y = "y", x_slices = 10, y_slices = 10) # run spatial SIR to go from 50 columns/directions (from PCA) down to 10
+
+mouse_pca <- prcomp(genomic_data[,-(352:353)])$x[,1:10] %>% as.data.frame()
+
+#### Doing the categorical SIR properly (23 Oct edit)
+mouse_sir <- categorical_sir(X = mouse_x, Y = mouse_celltype, directions = 10)[[1]]
+mouse_pca <- prcomp(genomic_data[,-(352:353)])$x[,1:50] %>% as.data.frame() # run PCA to go from 351 columns to 50 directions
+mouse_pca_sir <- categorical_sir(X = mouse_pca, Y = mouse_celltype, directions = 10)[[1]]
+```
+
+# Clustering (spatial focus)
+
+## Find optimal k for kmeans
+
+Note: this takes a long time to run.
+
+wss method on 3 dimension reduction methods.
+
+```{r, warning = FALSE}
+library(factoextra)
+fviz_nbclust(mouse_sir, kmeans, method = "wss", k.max = 30)
+fviz_nbclust(mouse_pca_sir, kmeans, method = "wss", k.max = 30)
+fviz_nbclust(mouse_pca, kmeans, method = "wss", k.max = 30)
+```
+
+silhouette method
+
+```{r}
+fviz_nbclust(mouse_sir, kmeans, method = "silhouette", k.max = 30)
+fviz_nbclust(mouse_pca_sir, kmeans, method = "silhouette", k.max = 30)
+fviz_nbclust(mouse_pca, kmeans, method = "silhouette", k.max = 30)
+```
+
+## Clustering based on SIR dimension reduction
+
+```{r, warning = FALSE}
+sir_clusters <- setNames(kmeans(mouse_sir, nstart = 100, centers = 24)$cluster, NULL)
+
+sir_clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(mouse_sir)) %>% as.data.frame()
+sir_clusters_celltypes[,1] <- sir_clusters
+sir_clusters_celltypes[,2] <- meta[,7]
+
+cell_types <- unique(meta[,7]) # list of cell types
+
+counts_mat <- matrix(NA, nrow = 24, ncol = 24) # initialise empty matrix
+
+for (i in 1:24) { # for loop over each cell type
+  cell <- cell_types[i] 
+  cell_data <- sir_clusters_celltypes %>% filter(V2 == cell) # only look at current cell type
+  table <- table(cell_data$V1)
+  counts <- setNames(table, NULL) # for this true cell type, how many cells were assigned to all clusters
+  
+  nums <- as.numeric(names(table)) # find which clusters have at least one member who is current true cell type
+  for (j in 1:24) {
+    if (!(j %in% nums)) {
+      counts <- counts %>% append(0, j-1) # this will set counts of clusters that don't appear for the cell type to 0 (without this, they just wouldn't appear)
+    }
+  }
+  counts_mat[,i] <- counts
+}
+
+counts_df <- counts_mat %>% as.data.frame() # info into a df
+colnames(counts_df) <- cell_types
+
+cells_props_sir <- matrix(NA, nrow = length(cell_types), ncol = 3) %>% as.data.frame()
+colnames(cells_props_sir) <- c("celltype", "cluster", "proportion")
+
+for (i in 1:24) { # loop over all true cell types
+  col <- counts_df[,i]
+  total <- sum(col) # total number of observations of cell type
+  highest <- which.max(col) # find which cluster has the most observations for true cell type
+  print(c(colnames(counts_df)[i], highest, max(col)/total)) # print: cell type, which cluster has most observations, proportion of these cells in this cluster
+  cells_props_sir[i,] <- c(colnames(counts_df)[i], highest, max(col)/total)
+}
+cells_props_sir %>% dplyr::arrange(proportion)
+
+```
+
+## Clustering based on PCA + SIR (combined) dimension reduction
+
+```{r, warning = FALSE}
+pca_sir_clusters <- setNames(kmeans(mouse_pca_sir, nstart = 100, centers = 24)$cluster, NULL) # find which of 24 clusters each cell goes to
+
+pca_sir_clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(mouse_pca_sir)) %>% as.data.frame() # initialise empty df
+pca_sir_clusters_celltypes[,1] <- pca_sir_clusters # first column is which cluster it was given
+pca_sir_clusters_celltypes[,2] <- meta[,7] # second column is true cell type
+
+cell_types <- unique(meta[,7]) # list of cell types
+
+counts_mat <- matrix(NA, nrow = 24, ncol = 24) # initialise empty matrix
+
+for (i in 1:24) { # for loop over each cell type
+  cell <- cell_types[i] 
+  cell_data <- pca_sir_clusters_celltypes %>% filter(V2 == cell) # only look at current cell type
+  table <- table(cell_data$V1)
+  counts <- setNames(table, NULL) # for this true cell type, how many cells were assigned to all clusters
+  
+  nums <- as.numeric(names(table)) # find which clusters have at least one member who is current true cell type
+  for (j in 1:24) {
+    if (!(j %in% nums)) {
+      counts <- counts %>% append(0, j-1) # this will set counts of clusters that don't appear for the cell type to 0 (without this, they just wouldn't appear)
+    }
+  }
+  counts_mat[,i] <- counts
+}
+
+counts_df <- counts_mat %>% as.data.frame() # info into a df
+colnames(counts_df) <- cell_types
+
+cells_props_pca_sir <- matrix(NA, nrow = length(cell_types), ncol = 3) %>% as.data.frame()
+colnames(cells_props_pca_sir) <- c("celltype", "cluster", "proportion")
+
+for (i in 1:24) { # loop over all true cell types
+  col <- counts_df[,i]
+  total <- sum(col) # total number of observations of cell type
+  highest <- which.max(col) # find which cluster has the most observations for true cell type
+  print(c(colnames(counts_df)[i], highest, max(col)/total)) # print: cell type, which cluster has most observations, proportion of these cells in this cluster
+  cells_props_pca_sir[i,] <- c(colnames(counts_df)[i], highest, max(col)/total)
+}
+cells_props_pca_sir
+```
+
+## Clustering based on PCA dimension reduction
+
+```{r, warning = FALSE}
+pca_clusters <- setNames(kmeans(mouse_pca, nstart = 100, centers = 24)$cluster, NULL) # find which of 24 clusters each cell goes to
+
+pca_clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(mouse_pca)) %>% as.data.frame() # initialise empty df
+pca_clusters_celltypes[,1] <- pca_clusters # first column is which cluster it was given
+pca_clusters_celltypes[,2] <- meta[,7] # second column is true cell type
+
+cell_types <- unique(meta[,7]) # list of cell types
+
+counts_mat <- matrix(NA, nrow = 24, ncol = 24) # initialise empty matrix
+
+for (i in 1:24) { # for loop over each cell type
+  cell <- cell_types[i] 
+  cell_data <- pca_clusters_celltypes %>% filter(V2 == cell) # only look at current cell type
+  table <- table(cell_data$V1)
+  counts <- setNames(table, NULL) # for this true cell type, how many cells were assigned to all clusters
+  
+  nums <- as.numeric(names(table)) # find which clusters have at least one member who is current true cell type
+  for (j in 1:24) {
+    if (!(j %in% nums)) {
+      counts <- counts %>% append(0, j-1) # this will set counts of clusters that don't appear for the cell type to 0 (without this, they just wouldn't appear)
+    }
+  }
+  counts_mat[,i] <- counts
+}
+
+counts_df <- counts_mat %>% as.data.frame() # info into a df
+colnames(counts_df) <- cell_types
+
+cells_props_pca <- matrix(NA, nrow = length(cell_types), ncol = 3) %>% as.data.frame()
+colnames(cells_props_pca) <- c("celltype", "cluster", "proportion")
+
+for (i in 1:24) { # loop over all true cell types
+  col <- counts_df[,i]
+  total <- sum(col) # total number of observations of cell type
+  highest <- which.max(col) # find which cluster has the most observations for true cell type
+  print(c(colnames(counts_df)[i], highest, max(col)/total)) # print: cell type, which cluster has most observations, proportion of these cells in this cluster
+  cells_props_pca[i,] <- c(colnames(counts_df)[i], highest, max(col)/total)
+}
+cells_props_pca
+```
+
+## Comparing clustering accuracies between all 3 methods
+
+```{r}
+# df for clustering proportions from all methods
+p_sir <- cells_props_sir %>% dplyr::arrange(celltype)
+p_pca_sir <- cells_props_pca_sir %>% dplyr::arrange(celltype)
+p_pca <- cells_props_pca %>% dplyr::arrange(celltype)
+all_props <- matrix(c(p_sir$celltype, p_sir$proportion, p_pca_sir$proportion, p_pca$proportion), nrow = 24, ncol = 4, byrow = FALSE) %>% as.data.frame()
+colnames(all_props) <- c("celltype", "prop_sir", "prop_pca_sir", "prop_pca")
+all_props
+
+# df for cluster allocations for all methods, with coordinates
+coord_cluster_all <- matrix(NA, nrow = nrow(mouse_coords), ncol = 6) %>% as.data.frame()
+colnames(coord_cluster_all) <- c("x", "y", "true_celltype", "sir_cluster", "pca_sir_cluster", "pca_cluster")
+coord_cluster_all$x <- mouse_coords$x
+coord_cluster_all$y <- mouse_coords$y
+coord_cluster_all$sir_cluster <- sir_clusters
+coord_cluster_all$pca_sir_cluster <- pca_sir_clusters
+coord_cluster_all$pca_cluster <- pca_clusters
+coord_cluster_all$true_celltype <- meta[,7]
+coord_cluster_all
+```
+
+### SIR with 20x20 slices instead of 10x10
+
+See if number of slices makes much difference. Here try to do 20x20 instead of 10x10.
+
+```{r}
+mouse_sir_20 <- spatial_sir(dataset = genomic_data, directions <- 10, x = "x", y = "y", x_slices = 20, y_slices = 20) # just run spatial SIR (this doesn't actually take long)
+```
+
+# Week 9 notes
+
+Try also showing which tile each obsv is assigned to, see ARI between the tiles.
+
+Goal for now: make function where we can change whether we do PCA/SIR/both, change number of tiles, number of directions for each, (number of clusters (k in kmeans) - but this is after), where we can change those parameters, see sensitivity to those inputs .
+
+## Plots showing assigned celltype (cluster, shown by colour) after DR methods
+
+True clusters (celltypes)
+
+```{r}
+# true clusters in colour
+
+ggplot(coord_cluster_all, aes(x = x, y = -y, color = factor(true_celltype))) +
+  geom_point(size = 0.6) + 
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates Coloured by True Celltype") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = "none")
+```
+
+Predicted celltype (colour) based on clustering after PCA
+
+```{r}
+ggplot(coord_cluster_all, aes(x = x, y = -y, color = factor(pca_cluster))) + 
+  geom_point(size = 0.6) + 
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates Coloured by Cluster from PCA") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = "none")
+```
+
+Predicted celltype (colour) based on clustering after PCA + SIR
+
+```{r}
+ggplot(coord_cluster_all, aes(x = x, y = -y, color = factor(pca_sir_cluster))) + geom_point(size = 0.6) + 
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates Coloured by Cluster from PCA + SIR") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = "none")
+```
+
+Predicted celltype (colour) based on clustering after SIR
+
+```{r}
+ggplot(coord_cluster_all, aes(x = x, y = -y, color = factor(sir_cluster))) + 
+  geom_point(size = 0.6) + 
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates Coloured by Cluster from SIR") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = "none")
+```
+
+```{r}
+# ARI, BSS/TSS for above plots
+kmns_pca <- kmeans(mouse_pca, centers = 24)
+pca_bt <- kmns_pca$betweenss/kmns_pca$totss
+
+kmns_pca_sir <- kmeans(mouse_pca_sir, centers = 24)
+pca_sir_bt <- kmns_pca_sir$betweenss/kmns_pca_sir$totss
+
+kmns_sir <- kmeans(mouse_sir, centers = 24)
+sir_bt <- kmns_sir$betweenss/kmns_sir$totss
+
+pca_ari_ct <- adjustedRandIndex(coord_cluster_all$true_celltype, factor(coord_cluster_all$pca_cluster))
+pca_sir_ari_ct <- adjustedRandIndex(coord_cluster_all$true_celltype, factor(coord_cluster_all$pca_sir_cluster))
+sir_ari_ct <- adjustedRandIndex(coord_cluster_all$true_celltype, factor(coord_cluster_all$sir_cluster))
+
+celltype_kmns <- matrix(NA, ncol = 3, nrow = 6) %>% as.data.frame()
+colnames(celltype_kmns) <- c("method", "metric", "value")
+celltype_kmns$method <- c("PCA", "PCA_SIR", "SIR", "PCA", "PCA_SIR", "SIR")
+celltype_kmns$metric <- c("BSS/TSS", "BSS/TSS", "BSS/TSS", "ARI", "ARI", "ARI")
+celltype_kmns$value <- c(pca_bt, pca_sir_bt, sir_bt, pca_ari_ct, pca_sir_ari_ct, sir_ari_ct)
+celltype_kmns
+ggplot(celltype_kmns, aes(x = method, y = value)) +
+  geom_bar(stat="identity", fill = "#ede3da", width = 0.3, color = "#31394d") +
+  facet_wrap(~metric, scales = "free") +
+  labs(x = "Method", y = "Value") +
+  ggtitle("Quantitative Performance Metrics of DR Prior to Clustering") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+Ideas for improvement and evaluation:
+
+Vary k in kmeans, evaluate best k by finding maximal BSS/TSS.
+
+Vary number of directions, see if this does anything to BSS/TSS (in function - see above)
+
+## ARI
+
+Finding ARI between predicted and actual clusters, after DR by each of the three methods. Outputted from this chunk is (for each method) betweenss/totalss, and the ARI between predicted and actual clusters.
+
+We want higher betweenss/totalss, and also higher ARI. PCA does extremely well here, which makes sense since the true celltypes were produced by PCA (hence are not perfectly "true" but are pretty close to true).
+
+```{r, warning=FALSE}
+#kmeans_pca_sir <- kmeans(mouse_pca_sir, nstart = 100, centers = 24)
+
+c(kmeans_pca_sir$betweenss/kmeans_pca_sir$totss)
+
+adjustedRandIndex(x = pca_sir_clusters_celltypes$V1, y = pca_sir_clusters_celltypes$V2)
+
+
+
+#kmeans_sir <- kmeans(mouse_sir, nstart = 100, centers = 24)
+
+c(kmeans_sir$betweenss/kmeans_sir$totss)
+
+adjustedRandIndex(x = sir_clusters_celltypes$V1, y = sir_clusters_celltypes$V2)
+
+
+#kmeans_pca <- kmeans(mouse_pca, nstart = 100, centers = 24)
+
+c(kmeans_pca$betweenss/kmeans_pca$totss)
+
+adjustedRandIndex(x = pca_clusters_celltypes$V1, y = pca_clusters_celltypes$V2)
+
+```
+
+## Find best k for for kmeans in the PCA + SIR DR method
+
+Evaluate with ARI
+
+PCA and SIR:
+```{r, warning=FALSE, message = FALSE}
+k <- c(1:10)*10
+
+for (i in k) {
+  kmns <- kmeans(mouse_pca_sir, nstart = 100, centers = i)
+  bss <- kmns$betweenss
+  tss <- kmns$totss
+  bt <- bss/tss
+  print(c(i, bt))
+  
+  #clusters <- setNames(kmns$cluster, NULL) 
+
+  #clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(coords)) %>% as.data.frame()
+  #clusters_celltypes[,1] <- clusters
+  #clusters_celltypes[,2] <- meta[,7]
+  #ari <- adjustedRandIndex(clusters_celltypes$V1, clusters_celltypes$V2)
+  #print(c(i, ari))
+}
+```
+
+(Notes) Possible Evaluation Methods
+
+Adjusted rand index for quantitative assessment of clustering. To do that:
+mclust::adjustedRandIndex
+
+Find how distinct the clusters are: kmeans has many components good for this: betweenss for between-cluster SS
+
+do plot with true x and y, coloured by assigned cluster: does this colour correlate to the tiles from the SIR
+
+## Clustering with just PCA
+
+```{r, warning = FALSE}
+pca_clusters <- setNames(kmeans(mouse_pca, nstart = 100, centers = 24)$cluster, NULL) # find which of 24 clusters each cell goes to
+
+pca_clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(coords)) %>% as.data.frame() # initialise empty df
+pca_clusters_celltypes[,1] <- pca_clusters # first column is which cluster it was given
+pca_clusters_celltypes[,2] <- meta[,7] # second column is true cell type
+
+cell_types <- unique(meta[,7]) # list of cell types
+
+counts_mat <- matrix(NA, nrow = 24, ncol = 24) # initialise empty matrix
+
+for (i in 1:24) { # for loop over each cell type
+  cell <- cell_types[i] 
+  cell_data <- pca_clusters_celltypes %>% filter(V2 == cell) # only look at current cell type
+  table <- table(cell_data$V1)
+  counts <- setNames(table, NULL) # for this true cell type, how many cells were assigned to all clusters
+  
+  nums <- as.numeric(names(table)) # find which clusters have at least one member who is current true cell type
+  for (j in 1:24) {
+    if (!(j %in% nums)) {
+      counts <- counts %>% append(0, j-1) # this will set counts of clusters that don't appear for the cell type to 0 (without this, they just wouldn't appear)
+    }
+  }
+  counts_mat[,i] <- counts
+}
+
+counts_df <- counts_mat %>% as.data.frame() # info into a df
+colnames(counts_df) <- cell_types
+
+for (i in 1:24) { # loop over all true cell types
+  col <- counts_df[,i]
+  total <- sum(col) # total number of observations of cell type
+  highest <- which.max(col) # find which cluster has the most observations for true cell type
+  print(c(colnames(counts_df)[i], highest, max(col)/total)) # print: cell type, which cluster has most observations, proportion of these cells in this cluster
+}
+```
+
+# Function to combine slice numbers, k means, DR method
+
+As described somewhere above, this function combines all those possible configurations into one function. The output is the ARI and the betweenss/totalss.
+
+```{r, warning = FALSE}
+# Methods: SIR, PCA, PCA+SIR
+
+## how many SIR directions to use? How many PCs to use?
+
+# K: find which k is best for kmeans. Evaluate by maximising BSS/TSS
+
+# Slice numbers: give options (same for x and y)
+
+dr_mouse <- function(method, pc = 10, pc_before_sir = 50, dir = 10, slices = 10, graph = TRUE, k = 24) {
+  if (method == "SIR") {
+    
+    reduced <- spatial_sir(dataset = genomic_data, directions <- dir, x = "x", y = "y", x_slices = slices, y_slices = slices)
+      
+  } else if (method == "SIR and PCA") {
+    
+    genomic_pca <- prcomp(genomic_data)$x[,1:pc_before_sir] %>% as.data.frame()
+    genomic_pca$x <- genomic_data$x
+    genomic_pca$y <- genomic_data$y
+    reduced <- spatial_sir(dataset = genomic_pca, directions = dir, x = "x", y = "y", x_slices = slices, y_slices = slices)
+    
+  } else if (method == "PCA") {
+    
+    reduced <- prcomp(genomic_data[,-(352:353)])$x[,1:pc] %>% as.data.frame()
+    
+  } else {
+    return("Invalid method")
+  }
+  
+  kmns <- kmeans(reduced, nstart = 100, centers = k)
+  clusters <- setNames(kmns$cluster, NULL) 
+  clusters_celltypes <- matrix(NA, ncol = 2, nrow = nrow(coords)) %>% as.data.frame()
+  clusters_celltypes[,1] <- clusters
+  clusters_celltypes[,2] <- meta[,7]
+  
+  if (graph) {
+    graph <- 2
+  }
+  ari <- adjustedRandIndex(x = clusters_celltypes$V1, y = clusters_celltypes$V2)
+  bt <- kmns$betweenss / kmns$totss
+  return(c("ARI: ", ari, "BetweenSS / TotalSS: ", bt))
+}
+
+dr_mouse(method = "SIR", slices = 20)
+```
+
+# Week 10 notes
+
+try only on brain: subset data to only get brain
+
+Then the genes with high loadings from doing SIR on brain will be useful for brain development
+
+Also can we separate the brain areas?
+
+```{r}
+brain_genomic_data <- cbind(genomic_data, meta[,7])
+colnames(brain_genomic_data)[354] <- "celltype"
+brain_genomic_data <- brain_genomic_data %>% filter(celltype == "Forebrain/Midbrain/Hindbrain")
+brain_X <- brain_genomic_data[,-c(352,353,354)]
+brain_coords <- brain_genomic_data %>% dplyr::select(c("x", "y"))
+
+brain_sliced <- spatial_slicer(X = brain_X, slices = 10, coords = brain_coords)
+brain_allocation <- spatial_allocator(X = brain_X, coords = brain_coords, slices = 10)
+unique(brain_allocation$coordinate)
+sliced_data_centered <- scale(brain_sliced, center = TRUE, scale = FALSE)
+nslices = 10
+W <- diag(10^2)
+dim(brain_sliced)
+dim(sliced_data_centered)
+m <- (t(as.matrix(sliced_data_centered)) %*% W %*% sliced_data_centered)/(nslices-1)
+
+brain_sir_tile <- spatial_sir(X = brain_X, directions = 5, slices = 10, coords = brain_coords)
+
+brain_pca <- prcomp(brain_genomic_data[,-(352:353)])$x[,1:5] %>% as.data.frame()
+
+plot(brain_sir_tile[[1]][,1:2], ylim = c(-5,5))
+
+brain_sir_tile_pos <- cbind(brain_sir_tile, brain_genomic_data$x) %>% cbind(brain_genomic_data$y)
+
+colnames(brain_sir_tile_pos)[7:8] <- c("x", "y")
+
+brain_sir_tile_pos <- brain_sir_tile_pos %>% filter(y < 0)
+
+qplot(brain_sir_tile_pos$x, brain_sir_tile_pos$y, colour = brain_sir_tile_pos$PC5)
+
+```
+
+
+# Presentation 
+
+Tips:
+
+Say we are still in the discovery phase of the project (before implementation and eval)
+
+Main message: DR is better (how is it better?) when you take into account y: see it in the data types (binary and sin, s
+
+Scheduling:
+Wednesday 11am timed practice honours preso (in person). 
+
+Below: UMAP plot of just the brain cells after performing DR by SIR.
+
+```{r}
+umapbrain <- umap(brain_sir_tile_pos[,1:5])
+#umapbrain
+
+plot(umapbrain)
+
+#gganimate to animate between the umap plot below and real coords
+
+#ggiraph: g1 use umap1 and umap2, then for g2 use real x and y
+
+```
+
+Changing data format so I can use ggiraph
+
+```{r}
+brain_sir_tile_pos <- brain_sir_tile_pos %>% as.data.frame()
+umapbrain <- umapbrain %>% as.data.frame()
+```
+
+## ggiraph plot
+
+True spatial positions, then positions on the first two SIR, PCA directions.
+
+Note: SIR is just SIR here, not PCA + SIR.
+
+```{r}
+point_size <- 0.5
+
+umapbrain$uniqueID <- rownames(umapbrain)
+brain_sir_tile_pos$uniqueID <- rownames(brain_sir_tile_pos)
+brain_pca$uniqueID <- rownames(brain_pca)
+
+g1 = ggplot(umapbrain, aes(x = V1, y = V2)) + 
+    geom_point_interactive(aes(tooltip = uniqueID, data_id = uniqueID), size = point_size,
+                           colour = "grey") +
+    theme_classic() +
+    theme(legend.position = "none") + 
+    coord_fixed() +
+    NULL
+  
+  g3 = ggplot(brain_pca, aes(x = PC1, y = PC2)) + 
+    geom_point_interactive(aes(tooltip = uniqueID, data_id = uniqueID), size = point_size,
+                           colour = "grey") +
+    coord_fixed() +
+    theme_classic() +
+    theme(legend.position = "none") + 
+    NULL
+
+  g2 = ggplot(brain_sir_tile_pos, aes(x = x, y = y)) + 
+    geom_point_interactive(aes(tooltip = uniqueID, data_id = uniqueID), size = point_size,
+                           colour = "grey") +
+    coord_fixed() +
+    theme_classic() +
+    theme(legend.position = "none") + 
+    NULL
+  
+  out = girafe(code = print(g1 + g2 + g3), width_svg = 8, height_svg = 4, options = list(
+    opts_hover(css = "fill:#FF3333;stroke:black;cursor:pointer;size:0.0001", reactive = TRUE),
+    opts_selection(type = "multiple", css = "fill:#FF3333;stroke:red;", only_shiny = FALSE)
+  ))
+
+# could have g3 as PCA as well, show that it is terrible without feature selection or extraction
+
+out
+```
+
+Comments on above ggiraph:
+
+Find how to export out ggiraph "out" object, send that or put in preso?
+
+Make histogram of number of cells in each slice 
+
+## Presentation feedback
+
+DONE flowchart: make it diagonal in a straight line
+
+DONE motivation: we have DR, we also have y for this. Should we use X only, or take y into account? Yes should, look at sin graph for evidence. When ultimate purpose is to classify y
+
+DONE Make clear that SIR is supervised
+
+DONE Include diagram on how to slice as in Linh's preso 
+
+if question on supervised PCA: we will compare in future performance of that vs SIR
+
+DONE for rnorm on sin slide: draw from ind norm
+
+explain why PCA fails: it captures variability of X, not X in direction of Y
+
+in reality: wouldn't know y = sin(X), SIR1 gives near monotonic relationship with Y
+
+DONE slide 3: transform X (n x p) into Z (n x k), where k << p, where Z is still able to predict Y well. Use that in the explanation of SIR, and in example: reduce 5 X predictors into just one on the plot
+
+DONE Another thing for what to do next: use SIR for dimension reduction, then SVM for training a model. On testing: do SIR on new data then the trained SVM, then evaluate. Compare that to PCA then SVM training. SIR should get a better rotation of X. 
+
+Eventually: compare SIR + SVM to deep learning
+
+PCA has no change depending on what Y is
+
+Use all of that to predict position (x,y) or cell type on the mouse
+
+Need what we use as Y to stay same: what we use for slicing is also what we want to eventually predict (e.g don't use position for slicing, then predict cell type)
+
+DONE Good way to evaluate: in classification setting on unseen and unlabelled data (future, but include)
+
+DONE Add labels on slide 5, make clear what seeing: context there, maybe animate images to only see one at a time
+
+Make concluding statement
+
+DONE Gene expr coord to predict spatial: want to use x and y in the DR
+
+In mouse example: X is the gene expression data, Y is the position (sliced into tiles).
+
+Do diagrams to explain normal slicing, and spatial slicing into tiles
+
+SIR uses the exprs as well as the tiles
+
+# Week 11 Notes
+
+Weighted SIR: use W
+This gives better averaging
+Could use 1 - pairwise distance
+
+Case study: predict position with mice: use SVM/CNN/KNN/RF
+
+Make function for all spaceSIR <- function(X = n x p, Y = n x k, weight = weights)
+Note: k can be any integer for any dimensional space
+Output: a list with scores and loadings (want both for interpretation and modelling)
+
+Geospatial maps data another application (e.g from Google maps), not so important now 
+
+Use multiple mice or just split the one for training and test 
+
+Probably smaller tiles are needed, but test that.
+
+Try space1 = sin(XB) (+ noise) and space2 = cos(XB) (+ noise)
+
+Instead of tiles, what if do pre-set domains of similiar cell types (not necessarily rectangular shapes)
+
+done Decouple slicing and SIRing function, in case user wants to already provide slices for each row.
+done If slices not provided, just call slice function within SIR function
+
+Need to be predicting something for the whole method to make sense
+
+Try having .r files for the functions, e.g spaceSIR
+then can do "source functions.r" at start of RMD
+Could use those functions in many RMD files
+
+Make X a matrix for the functions, Y a dataframe or matrix
+Be careful with using matrices or dataframes, be consistent 
+
+```{r}
+
+univariate_sir(X = test_x, Y = test_y, slices = 10, directions = 5, W = matrix(rep(1, 100), ncol = 10, nrow = 10))
+```
+
+# Week 12 meeting notes
+
+Go for classification with above scores and betas
+
+Hypothesis testing to find optimal number of directions: which eigenvalues are significantly different from 0, stop there (e.g with threshold) 
+
+Use cell types as Y (for univariate), then predict with SVM - may need to adjust method to account for categorical Y 
+
+Project X along PCA or SIR, then train and test on that.
+
+After that and spatial done: then spatial info 
+
+Can do a W matrix based on cell types, use 1 - tree distance for entries in W matrix 
+
+Can simulate tree with cell types 
+
+Find constraints on W matrix
+
+Function to get W matrix given different data: e.g tree distance, euclidean distance between centroids (for spatial)
+get_w <- function(slice_characteristics (are they cell types, locations etc)) {} to find distance between slices
+return(matrix with row and column names = slice names, this is a distance matrix)
+
+Find a way to get distance between slices:
+easy for spatial: can use dist() for euclidean distance between slice centroids
+V easy for univariate: euclidean distances along number line (can also use dist())
+Make user provide the W matrix if categorical Y (e.g cell types).
+
+Some accounting for weights is done already (see dr package info), but this is in slice sizes, instead of tile distances
+
+# Week 13 Notes
+
+## Scheduling
+
+zoom meet next monday (STUVAC)
+
+When we are away:
+Me: 7/8 July for 2 weeks
+
+Shila: 3 July leave for 1 week
+
+Linh: 11-15 June, 29 June to 4 July
+
+
+
+Exam Week 1: normal meet
+
+Holiday meets: 19 June (perhaps change), 26 June
+
+Sem2 O week: as usual (24 July), then as usual 
+
+# Cell Type Prediction
+
+# SIR then SVM
+
+Creating the SIR object 
+
+```{r}
+genomic_w_cell_type <- genomic_data[,-c(352, 353)]
+genomic_w_cell_type$celltype <- meta[,7]
+
+genom_cell_sir <- categorical_sir(X = genomic_w_cell_type[,1:351], Y = as.data.frame(genomic_w_cell_type[,352]), directions = 23)
+```
+
+Tasks: (from exam week 1)
+
+see why it is different to if we use sir_all 
+
+Check ordering of cells in the new W matrix is the same as the order of the cells in the sliced data
+
+Below: overall accuracy after performing SVM on the SIR object. Note: this is resubstitution; cross-validation is later. 
+
+```{r}
+sir_svm <- svm(genom_cell_sir[[1]], factor(meta[,7]))
+sir_svm_resubbed_labels <- predict(sir_svm)
+correct_sir <- table(meta[,7], sir_svm_resubbed_labels) %>% unclass() %>% diag() %>% sum()
+correct_sir/11026
+```
+
+## PCA then SVM
+
+Obtaining the first 24 PCs, then performing (resubstituted) SVM on that and getting an accuracy.
+
+```{r}
+pc_genom <- prcomp(genomic_data[,-c(352,353)])$x[,1:24]
+
+pca_svm <- svm(pc_genom, factor(meta[,7]))
+pca_svm_resubbed_labels <- predict(pca_svm)
+correct_pca <- table(meta[,7], pca_svm_resubbed_labels) %>% unclass() %>% diag() %>% sum()
+correct_pca/11026
+```
+
+## LDA then SVM
+
+```{r}
+sir_lda <- lda(genomic_data[,-c(352,353)], grouping = factor(meta[,7]))
+sir_lda_resubbed_labels <- predict(sir_lda, newdata = genomic_data[,-c(352,353)])$class
+correct_sir_lda <- table(meta[,7], sir_lda_resubbed_labels) %>% unclass() %>% diag() %>% sum()
+correct_sir_lda/11026
+# this is bad because very high dimensional 
+```
+
+Try above on other methods
+
+## Just svm
+
+Note: may take a while to run. 
+
+```{r}
+just_svm <- svm(genomic_data[,-c(352,353)], factor(meta[,7]))
+just_svm_resubbed_labels <- predict(just_svm)
+correct_none <- table(meta[,7], just_svm_resubbed_labels) %>% unclass() %>% diag() %>% sum()
+correct_none/11026
+```
+
+Tasks: (for stuvac)
+
+Put those into CV setups (the just svm was probably very overfitting) to get a better accuracy 
+Stratified CV to make sure there is some of each class in the training data 
+4 cases: SIR + SVM, PCA + SVM, (just) LDA, (just) SVM. Edit: this is not necessary since there are similiar class levels in each fold. 
+
+# CV for predicting celltype
+
+Using code from DATA3888. 
+
+The outputs for these are accuracies (changes for each chunk) and time taken.
+
+## SIR then SVM
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 1
+X = genomic_w_cell_type[,-352]
+y = genomic_w_cell_type[,352]
+n = nrow(X)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = X[test_id, ]
+    X_train = X[-test_id, ]
+    y_test = y[test_id]
+    y_train = y[-test_id]
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+?svm
+?predict.svm
+cv_acc5_rtimes_test
+cv_acc5_rtimes_train
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+```
+
+Better to consistently have X as (numeric) matrix, Y as a dataframe: also those need to be separate.
+
+parallel package for parallel processing
+
+## PCA then SVM
+
+```{r}
+start = Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes = cv_acc5 = c()
+r = 3
+X = genomic_w_cell_type[,-352]
+y = genomic_w_cell_type[,352]
+n = nrow(X)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = X[test_id, ]
+    X_train = X[-test_id, ]
+    y_test = y[test_id]
+    y_train = y[-test_id]
+    
+    Z_pca <- prcomp(X_train)
+    
+    Z_train <- Z_pca$x[,1:24]
+    Z_test <- as.matrix(X_test) %*% Z_pca$rotation[,1:24]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted <- predict(fit5, newdata = Z_test)
+    
+    cv_acc5[j] = table(predicted, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+  }
+  cv_acc5_rtimes <- append(cv_acc5_rtimes, mean(cv_acc5))
+}
+
+cv_acc5_rtimes
+
+end <- Sys.time()
+end - start
+```
+
+## Just SVM
+
+```{r}
+start = Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes = cv_acc5 = c()
+r = 3
+X = genomic_w_cell_type[,-352]
+y = genomic_w_cell_type[,352]
+n = nrow(X)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = X[test_id, ]
+    X_train = X[-test_id, ]
+    y_test = y[test_id]
+    y_train = y[-test_id]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(X_train, y_train)
+    predicted <- predict(fit5, newdata = X_test)
+    
+    cv_acc5[j] = table(predicted, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+  }
+  cv_acc5_rtimes <- append(cv_acc5_rtimes, mean(cv_acc5))
+}
+
+cv_acc5_rtimes
+
+end <- Sys.time()
+
+time_taken <- end - start
+time_taken
+```
+
+## LDA
+
+```{r}
+start = Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes = cv_acc5 = c()
+r = 3
+X = genomic_w_cell_type[,-352]
+y = genomic_w_cell_type[,352]
+n = nrow(X)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = X[test_id, ]
+    X_train = X[-test_id, ]
+    y_test = y[test_id]
+    y_train = y[-test_id]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = lda(X_train, y_train)
+    predicted <- predict(fit5, newdata = X_test)$class
+    
+    cv_acc5[j] = table(predicted, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+  }
+  cv_acc5_rtimes <- append(cv_acc5_rtimes, mean(cv_acc5))
+}
+
+cv_acc5_rtimes
+
+end <- Sys.time()
+
+time_taken <- end - start
+time_taken
+```
+
+## All methods in one loop
+
+```{r}
+# Changing this to remove LDA and just SVM, add in PCA + SIR
+
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_sir = cv_acc5_sir = c()
+cv_acc5_rtimes_pca = cv_acc5_pca = c()
+cv_acc5_rtimes_pca_sir = cv_acc5_pca_sir = c()
+#cv_acc5_rtimes_svm = cv_acc5_svm = c()
+cv_acc5_rtimes_lda = cv_acc5_lda = c()
+r = 2
+
+X = mouse_x
+y = mouse_celltype
+colnames(y) <- c("celltype")
+y$celltype <- as.factor(y$celltype)
+
+n = nrow(X)
+
+accuracies_mat_sir <- matrix(NA, nrow = length(unique(y$celltype)), ncol = 1) %>% as.data.frame()
+colnames(accuracies_mat_sir) <- c("celltype")
+accuracies_mat_sir$celltype <- unique(y$celltype)
+accuracies_mat_pca <- matrix(NA, nrow = length(unique(y$celltype)), ncol = 1) %>% as.data.frame()
+colnames(accuracies_mat_pca) <- c("celltype")
+accuracies_mat_pca$celltype <- unique(y$celltype)
+accuracies_mat_pca_sir <- matrix(NA, nrow = length(unique(y$celltype)), ncol = 1) %>% as.data.frame()
+colnames(accuracies_mat_pca_sir) <- c("celltype")
+accuracies_mat_pca_sir$celltype <- unique(y$celltype)
+accuracies_mat_lda <- matrix(NA, nrow = length(unique(y$celltype)), ncol = 1) %>% as.data.frame()
+colnames(accuracies_mat_lda) <- c("celltype")
+accuracies_mat_lda$celltype <- unique(y$celltype)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_sir = NA  # initialise results vector
+  cv_acc5_pca = NA  # initialise results vector
+  cv_acc5_pca_sir = NA  # initialise results vector
+  #cv_acc5_svm = NA  # initialise results vector
+  cv_acc5_lda = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = X[test_id, ]
+    X_train = X[-test_id, ]
+    y_test = y[test_id,]
+    y_train = y[-test_id,]
+    
+    ### SIR + SVM
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train_sir <- Z_sir[[1]]
+    Z_test_sir <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    fit5_sir = svm(Z_train_sir, y_train)
+    predicted_sir <- predict(fit5_sir, newdata = Z_test_sir)
+    
+    cv_acc5_sir[j] = table(predicted_sir, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    
+    # Getting accuracy table for each cell type
+    
+    acc_table_sir <- table(predicted_sir, y_test)
+    acc_mat_sir <- matrix(NA, ncol = 1, nrow = length(names(acc_table_sir[,1]))) %>% as.data.frame()
+
+    colnames(acc_mat_sir) <- c("accuracy")
+
+    for (i in 1:length(names(acc_table_sir[,1]))) {
+      total <- setNames(acc_table_sir[,i], NULL) %>% sum()
+      amount_correct <- setNames(acc_table_sir[,i], NULL)[i]
+      proportion <- amount_correct/total
+      acc_mat_sir$accuracy[i] <- proportion
+    }
+    accuracies_mat_sir <- cbind(accuracies_mat_sir, acc_mat_sir)
+    
+    ### PCA + SVM
+    
+    Z_pca <- prcomp(X_train)
+    Z_train_pca <- Z_pca$x[,1:24]
+    Z_test_pca <- as.matrix(X_test) %*% Z_pca$rotation[,1:24]
+    
+    fit5_pca = svm(Z_train_pca, y_train)
+    predicted_pca <- predict(fit5_pca, newdata = Z_test_pca)
+    
+    cv_acc5_pca[j] = table(predicted_pca, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    
+    # Getting accuracy table for each cell type
+    
+    acc_table_pca <- table(predicted_pca, y_test)
+    acc_mat_pca <- matrix(NA, ncol = 1, nrow = length(names(acc_table_pca[,1]))) %>% as.data.frame()
+
+    colnames(acc_mat_pca) <- c("accuracy")
+
+    for (i in 1:length(names(acc_table_pca[,1]))) {
+      total <- setNames(acc_table_pca[,i], NULL) %>% sum()
+      amount_correct <- setNames(acc_table_pca[,i], NULL)[i]
+      proportion <- amount_correct/total
+      acc_mat_pca$accuracy[i] <- proportion
+    }
+    accuracies_mat_pca <- cbind(accuracies_mat_pca, acc_mat_pca)
+    
+    ### PCA + SIR + SVM
+    
+    Z60_train_pca <- Z_pca$x[,1:100]
+    Z60_sir <- categorical_sir(X = Z60_train_pca, Y = as.data.frame(y_train), directions = 23)
+    Z60_train_sir <- Z60_sir[[1]]
+    Z60_test_sir <- as.matrix(X_test) %*% Z_pca$rotation[,1:100] %*% Z60_sir[[2]]
+    
+    fit5_pca_sir = svm(Z60_train_sir, y_train)
+    predicted_pca_sir <- predict(fit5_pca_sir, newdata = Z60_test_sir)
+    
+    cv_acc5_pca_sir[j] = table(predicted_pca_sir, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    
+    # Getting accuracy table for each cell type
+    
+    acc_table_pca_sir <- table(predicted_pca_sir, y_test)
+    acc_mat_pca_sir <- matrix(NA, ncol = 1, nrow = length(names(acc_table_pca_sir[,1]))) %>% as.data.frame()
+
+    colnames(acc_mat_pca_sir) <- c("accuracy")
+
+    for (i in 1:length(names(acc_table_pca_sir[,1]))) {
+      total <- setNames(acc_table_pca_sir[,i], NULL) %>% sum()
+      amount_correct <- setNames(acc_table_pca_sir[,i], NULL)[i]
+      proportion <- amount_correct/total
+      acc_mat_pca_sir$accuracy[i] <- proportion
+    }
+    accuracies_mat_pca_sir <- cbind(accuracies_mat_pca_sir, acc_mat_pca_sir)
+    
+    ### Just SVM
+    
+    #fit5_svm = svm(X_train, y_train)
+    #predicted_svm <- predict(fit5_svm, newdata = X_test)
+    
+    #cv_acc5_svm[j] = table(predicted_svm, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    
+    ### LDA
+    
+    fit5_lda = lda(X_train, y_train)
+    predicted_lda <- predict(fit5_lda, newdata = X_test)$class
+    
+    cv_acc5_lda[j] = table(predicted_lda, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    
+    # getting accuracy table for each type
+    
+    acc_table_lda <- table(predicted_lda, y_test)
+    acc_mat_lda <- matrix(NA, ncol = 1, nrow = length(names(acc_table_lda[,1]))) %>% as.data.frame()
+
+    colnames(acc_mat_lda) <- c("accuracy")
+
+    for (i in 1:length(names(acc_table_lda[,1]))) {
+      total <- setNames(acc_table_lda[,i], NULL) %>% sum()
+      amount_correct <- setNames(acc_table_lda[,i], NULL)[i]
+      proportion <- amount_correct/total
+      acc_mat_lda$accuracy[i] <- proportion
+    }
+    accuracies_mat_lda <- cbind(accuracies_mat_lda, acc_mat_lda)
+  }
+  cv_acc5_rtimes_sir <- append(cv_acc5_rtimes_sir, mean(cv_acc5_sir))
+  cv_acc5_rtimes_pca <- append(cv_acc5_rtimes_pca, mean(cv_acc5_pca))
+  cv_acc5_rtimes_pca_sir <- append(cv_acc5_rtimes_pca_sir, mean(cv_acc5_pca_sir))
+  #cv_acc5_rtimes_svm <- append(cv_acc5_rtimes_svm, mean(cv_acc5_svm))
+  cv_acc5_rtimes_lda <- append(cv_acc5_rtimes_lda, mean(cv_acc5_lda))
+}
+
+print(c("sir:", cv_acc5_rtimes_sir))
+print(c("pca:", cv_acc5_rtimes_pca))
+print(c("pca_sir:", cv_acc5_rtimes_pca_sir))
+#print(c("svm:", cv_acc5_rtimes_svm))
+print(c("lda:", cv_acc5_rtimes_lda))
+
+pca_sir_avgs <- accuracies_mat_pca_sir[,2] + 
+  accuracies_mat_pca_sir[,3] +
+  accuracies_mat_pca_sir[,4] +
+  accuracies_mat_pca_sir[,5] + 
+  accuracies_mat_pca_sir[,6] +
+  accuracies_mat_pca_sir[,7] +
+  accuracies_mat_pca_sir[,8] +
+  accuracies_mat_pca_sir[,9] +
+  accuracies_mat_pca_sir[,10] +
+  accuracies_mat_pca_sir[,11]
+accuracies_mat_pca_sir$avg <- pca_sir_avgs/10
+accuracies_mat_pca_sir
+
+sir_avgs <- accuracies_mat_sir[,2] + 
+  accuracies_mat_sir[,3] +
+  accuracies_mat_sir[,4] +
+  accuracies_mat_sir[,5] + 
+  accuracies_mat_sir[,6] +
+  accuracies_mat_sir[,7] +
+  accuracies_mat_sir[,8] +
+  accuracies_mat_sir[,9] +
+  accuracies_mat_sir[,10] +
+  accuracies_mat_sir[,11]
+accuracies_mat_sir$avg <- sir_avgs/10
+accuracies_mat_sir
+
+pca_avgs <- accuracies_mat_pca[,2] + 
+  accuracies_mat_pca[,3] +
+  accuracies_mat_pca[,4] +
+  accuracies_mat_pca[,5] + 
+  accuracies_mat_pca[,6] +
+  accuracies_mat_pca[,7] +
+  accuracies_mat_pca[,8] +
+  accuracies_mat_pca[,9] +
+  accuracies_mat_pca[,10] +
+  accuracies_mat_pca[,11]
+accuracies_mat_pca$avg <- pca_avgs/10
+accuracies_mat_pca
+
+celltype_accs <- matrix(NA, nrow = 25, ncol = 4) %>% as.data.frame()
+colnames(celltype_accs) <- c("celltype", "sir", "pca", "pca_sir")
+celltype_accs$celltype <- c(unique(y_train), "overall")
+celltype_accs$sir <- c(accuracies_mat_sir$avg, mean(cv_acc5_rtimes_sir))
+celltype_accs$pca <- c(accuracies_mat_pca$avg, mean(cv_acc5_rtimes_pca))
+celltype_accs$pca_sir <- c(accuracies_mat_pca_sir$avg, mean(cv_acc5_rtimes_pca_sir))
+celltype_accs %>% arrange(celltype)
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+overall_ct_pr_df <- matrix(NA, nrow = 4, ncol = 2) %>% as.data.frame()
+colnames(overall_ct_pr_df) <- c("Method", "Value")
+overall_ct_pr_df$Method <- c("SIR", "PCA", "PCA_SIR", "LDA")
+overall_ct_pr_df$Value <- c(mean(cv_acc5_rtimes_sir), mean(cv_acc5_rtimes_pca), mean(cv_acc5_rtimes_pca_sir), mean(cv_acc5_rtimes_lda))
+overall_ct_pr_df %>% ggplot(aes(x = Method, y = Value)) +
+  geom_bar(stat="identity", fill = "#ede3da", width = 0.3, color = "#31394d") +
+  labs(x = "Method", y = "Value") +
+  ggtitle("Accuracy of Predictions based on DR Methods") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Accuracy matrices
+
+In the next chunks (one for each method) the output is an accuracy matrix that shows the accuracies on each cell type over each of the 5 folds, as well as the average.
+
+## SIR then SVM: see accuracy matrix with one fold 
+
+```{r}
+source("sir_functions.R")
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+#without_low_quality <- genomic_w_cell_type# %>% filter(celltype != "Low quality")
+#class(without_low_quality)
+#length(unique(without_low_quality$celltype))
+#X = without_low_quality[,-352]
+#y = without_low_quality[,352]
+#n = nrow(X)
+
+X = mouse_x
+y = mouse_celltype
+colnames(y) <- c("celltype")
+y$celltype <- as.factor(y$celltype)
+n = nrow(X)
+
+cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+cv_acc5 = NA  # initialise results vector
+  
+test_id = cvSets$subsets[cvSets$which == 1]
+X_test = X[test_id, ]
+X_train = X[-test_id, ]
+y_test = y[test_id,]
+y_train = y[-test_id,]
+    
+Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 22)
+Z_train <- Z_sir[[1]]
+Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+fit5 = svm(Z_train, factor(y_train))
+predicted <- predict(fit5, newdata = Z_test)
+    
+cv_acc5 = table(predicted, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+
+cv_acc5
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+acc_table_1CV <- table(predicted, y_test)
+setNames(acc_table_1CV[,1], NULL)
+
+# Find accuracy for each cell type
+
+accuracies_mat <- matrix(NA, ncol = 2, nrow = length(names(acc_table_1CV[,1]))) %>% as.data.frame()
+
+colnames(accuracies_mat) <- c("cell", "accuracy")
+accuracies_mat$cell <- names(acc_table_1CV[,1])
+
+for (i in 1:length(names(acc_table_1CV[,1]))) {
+  total <- setNames(acc_table_1CV[,i], NULL) %>% sum()
+  amount_correct <- setNames(acc_table_1CV[,i], NULL)[i]
+  proportion <- amount_correct/total
+  accuracies_mat$accuracy[i] <- proportion
+}
+
+accuracies_mat
+
+Z_train2 <- as.matrix(X_train) %*% Z_sir[[2]]
+identical(Z_train, Z_train2)
+
+plot(Z_train2[,1], Z_train[,1])
+```
+
+## PCA then SVM: see accuracy matrix with one fold 
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+without_low_quality <- genomic_w_cell_type# %>% filter(celltype != "Low quality") 
+#length(unique(without_low_quality$celltype))
+X = without_low_quality[,-352]
+y = without_low_quality[,352]
+n = nrow(X)
+
+cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+cv_acc5 = NA  # initialise results vector
+  
+test_id = cvSets$subsets[cvSets$which == 1]
+X_test = X[test_id, ]
+X_train = X[-test_id, ]
+y_test = y[test_id]
+y_train = y[-test_id]
+    
+Z_pca <- prcomp(X_train)
+    
+Z_train <- Z_pca$x[,1:24]
+Z_test <- as.matrix(X_test) %*% Z_pca$rotation[,1:24]
+    
+fit5 = svm(Z_train, factor(y_train))
+predicted <- predict(fit5, newdata = Z_test)
+    
+cv_acc5 = table(predicted, factor(y_test)) %>% diag %>% sum %>% `/`(length(y_test))
+
+cv_acc5
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+acc_table_1CV <- table(predicted, y_test)
+
+# Find accuracy for each cell type
+
+accuracies_mat <- matrix(NA, ncol = 2, nrow = length(names(acc_table_1CV[,1]))) %>% as.data.frame()
+
+colnames(accuracies_mat) <- c("cell", "accuracy")
+accuracies_mat$cell <- names(acc_table_1CV[,1])
+
+for (i in 1:length(names(acc_table_1CV[,1]))) {
+  total <- setNames(acc_table_1CV[,i], NULL) %>% sum()
+  amount_correct <- setNames(acc_table_1CV[,i], NULL)[i]
+  proportion <- amount_correct/total
+  accuracies_mat$accuracy[i] <- proportion
+}
+
+accuracies_mat
+
+genom_labels[,1] %>% unique()
+
+Z_train2 <- as.matrix(X_train) %*% Z_sir[[2]]
+identical(Z_train, Z_train2)
+```
+
+# SIR + SVM: 1 CV fold, accuracy per cell type
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+without_low_quality <- genomic_w_cell_type# %>% filter(celltype != "Low quality") 
+#length(unique(without_low_quality$celltype))
+X = without_low_quality[,-352]
+y = without_low_quality[,352]
+n = nrow(X)
+
+cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+accuracies_df <- matrix(NA, ncol = 7, nrow = length(unique(y))) %>% as.data.frame()
+
+colnames(accuracies_df) <- c("cell", "fold1_accuracy", "fold2_accuracy", "fold3_accuracy", "fold4_accuracy", "fold5_accuracy", "average_accuracy")
+accuracies_df$cell <- unique(y)
+
+for (j in 1:cvK) {
+  test_id = cvSets$subsets[cvSets$which == j]
+  X_test = X[test_id, ]
+  X_train = X[-test_id, ]
+  y_test = y[test_id]
+  y_train = y[-test_id]
+    
+  Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+  Z_train <- Z_sir[[1]]
+  Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+  fit5 = svm(Z_train, factor(y_train), type = "C")
+  predicted <- predict(fit5, newdata = Z_test)
+    
+  acc_table_CV <- table(predicted, y_test)
+  
+  for (i in 1:length(unique(y))) {
+    total <- setNames(acc_table_CV[,i], NULL) %>% sum()
+    if (total == 0) {
+      accuracies_df[i, (j+1)] <- 0
+      next 
+    }
+    amount_correct <- setNames(acc_table_CV[,i], NULL)[i]
+    proportion <- amount_correct/total
+    accuracies_df[i, (j+1)] <- proportion
+  }
+}
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+accuracies_df$average_accuracy <- apply(accuracies_df[,2:6], 1, mean)
+
+accuracies_df_sir <- accuracies_df
+accuracies_df_sir
+
+Z_train2 <- as.matrix(X_train) %*% Z_sir[[2]]
+identical(Z_train, Z_train2)
+
+cbind(table(y_test),table(y_train))
+```
+
+# PCA + SVM: 5 fold CV performed once
+
+Produced is accuracies per cell type. 
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+without_low_quality <- genomic_w_cell_type# %>% filter(celltype != "Low quality") 
+#length(unique(without_low_quality$celltype))
+X = without_low_quality[,-352]
+y = without_low_quality[,352]
+n = nrow(X)
+
+cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+accuracies_df <- matrix(NA, ncol = 7, nrow = length(unique(y))) %>% as.data.frame()
+
+colnames(accuracies_df) <- c("cell", "fold1_accuracy", "fold2_accuracy", "fold3_accuracy", "fold4_accuracy", "fold5_accuracy", "average_accuracy")
+accuracies_df$cell <- unique(y)
+
+for (j in 1:cvK) {
+  test_id = cvSets$subsets[cvSets$which == j]
+  X_test = X[test_id, ]
+  X_train = X[-test_id, ]
+  y_test = y[test_id]
+  y_train = y[-test_id]
+    
+  Z_pca <- prcomp(X_train)
+    
+  Z_train <- Z_pca$x[,1:24]
+  Z_test <- as.matrix(X_test) %*% Z_pca$rotation[,1:24]
+    
+  fit5 = svm(Z_train, factor(y_train), type = "C")
+  predicted <- predict(fit5, newdata = Z_test)
+    
+  acc_table_CV <- table(predicted, y_test)
+  
+  for (i in 1:length(unique(y))) {
+    total <- setNames(acc_table_CV[,i], NULL) %>% sum()
+    if (total == 0) {
+      accuracies_mat[i, (j+1)] <- 0
+      next 
+    }
+    amount_correct <- setNames(acc_table_CV[,i], NULL)[i]
+    proportion <- amount_correct/total
+    accuracies_df[i, (j+1)] <- proportion
+  }
+}
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+accuracies_df$average_accuracy <- apply(accuracies_df[,2:6], 1, mean)
+
+accuracies_df_pca <- accuracies_df
+accuracies_df_pca
+```
+
+# Exam W1 notes:
+
+See if accuracies from train and test are similiar:
+maybe not because of class imbalances
+
+See if Z_train projected and Z_test are identical matrices (see if bug in SIR function)
+
+stratified CV: do stratification for each cell type (not needed as proportions of cell types in train and test are pretty equal)
+
+# Comparison of where PCA, SIR
+
+See on which cells each method performs well. Each method is the corresponding DR followed by SVM for the prediction.
+
+```{r}
+accuracies_df_both <- matrix(NA, nrow = 24, ncol = 3) %>% as.data.frame()
+colnames(accuracies_df_both) <- c("cell", "sir_acc", "pca_acc")
+accuracies_df_both$cell <- accuracies_df_pca$cell
+accuracies_df_both$sir_acc <- accuracies_df_sir$average_accuracy
+accuracies_df_both$pca_acc <- accuracies_df_pca$average_accuracy
+```
+
+# Holiday week 1 notes
+
+For default weight matrix: instead of diag(1), use the number of cell types in each position. Include this in my implemention of categorical SIR
+
+Compare results from my implementation of SIR with results from using dr package (to check mine is correct). 
+
+Maybe the data we have isn't best for just predicting cell types, as it is very much intended for spatial. If get new data that is more specific for cell type, then we can trust those labels are correct. 
+
+Try doing PCA using x and y axes as just another gene (making 351 "genes"), and see if it is better like that. Will want to do a cleverer way later on.
+
+If you do PCA/SIR before SVM, then the non-linear structure will be lost (even if do SVM next).
+
+Goals from using new data: see if SIR still better. Is it better when you use spatial information in whatever way? is it better when we do weighting in some way?
+
+Will need to do feature selection, since new data has 30k genes. Often keep around 2000 genes. See Shila's code chunk for how to do that. 
+
+General advice: write up properly everything I've done up to now by the end of the holidays.
+Idea for structure: word vomit on page, then organise the TOC, then polish everything.
+Can definitely do all of introduction and exploration of other methods.
+Include everything we've done, and cull later. 
+Include things from presentation in the overleaf: diagrams, as well as the examples.
+Literature: find things, don't just copy, but can base the easy bits off those (as in where does SIR fit in the landscape of DR).
+
+Over next few days:
+
+check classifications are consistent with the dr package
+
+do classification of all methods on the new data, see if SIR is better on that. Check performance of the methods between the two datasets. 
+
+New data:
+
+```{r}
+library(MouseGastrulationData)
+new_data_21 <- EmbryoAtlasData(samples = 21)
+#head(AtlasSampleMetadata, n = 3)
+
+celltypes <- colData(new_data_21)$celltype
+celltypes_df <- matrix(celltypes, ncol = 1) %>% as.data.frame()
+
+new_data_df <- counts(new_data_21)
+```
+
+# 26 June notes
+
+Good template (that I will get later) has many details: how long each sections, what to include, how many figures, etc. This is a lot better than what Clara sent in email (that just gives the format). Edit: this is in slack
+
+The different scales between my SIR and package are from scaling the sigma inverse
+
+The new celltypes are made by PCA, see code in the .R file. 19 cells 
+
+heirarchical clustering on the column sums from the gene data to find similiarities between the celltypes. This informs our W matrix.
+
+Make the tree from above, see how far up the tree we have to go to find common anceestor, this distance gives similiarity. 
+
+16500 cells, 2200 genes, 19 cell types 
+
+for batches: first ignore the batch numbers and run them all together (the dimension will be in the above line), then do each separately and see if same results 
+
+don't forget to use number of directions as #celltypes - 1
+
+For the heirarchical clustering: can use aggregateAcrossCell(sce_filt, sce_filt$celltype) 
+Could even just use dist on that instead of heirarchical clustering 
+need use.assay.type = "logcounts"
+from scuttle package
+
+## New data from today (from dropbox in slack / on desktop)
+
+```{r}
+source()
+data <- readRDS("E8.5_sce_filt.RDS")
+data
+```
+
+
+
+
+
+
+# Spatial Weight Matrix Creation
+
+Goal: find centre (x,y) of each tile. Find distances between each tiles, and scale them to 0,1 where: 1 if same tile, close to 1 if tiles are close together, and 0 for the furthest apart tiles. 
+
+```{r}
+spatial_weight_matrix <- function(X_allocated, coords) {
+  avg_coords <- slicer(X = coords, provided = TRUE, allocation = X_allocated$coordinate)
+  #avg_coords$tile <- sort(unique(X_allocated$coordinate))
+  return(avg_coords)
+}
+
+allocd <- spatial_allocator(X = brain_X, coords = brain_coords, slices = 10)
+allocd[,352]
+
+length(unique(allocd$coordinate))
+
+tile_coords <- slicer(X = brain_coords, provided = TRUE, allocation = allocd$coordinate)
+tile_coords$name <- sort(unique(allocd$coordinate))
+
+slices <- length(unique(allocd$coordinate))
+
+empty_df <- matrix(rep(0, slices^2), nrow = slices) %>% as.data.frame()
+empty_df
+
+for (i in 1:slices) {
+  for (j in 1:slices) {
+    x_dist <- tile_coords$V1[i] - tile_coords$V1[j]
+    y_dist <- tile_coords$V2[i] - tile_coords$V2[j]
+    dist_pair <- sqrt(x_dist^2 + y_dist^2)
+    empty_df[i,j] = dist_pair
+    empty_df[j,i] = dist_pair
+  }
+}
+dist_df <- 1 - empty_df / max(empty_df)
+min(dist_df)
+max(dist_df)
+
+dist_df
+```
+
+Testing SIR on brain data with distance matrix as above.
+
+```{r}
+spatial_sir(X = brain_X, coords = brain_coords, slices = 10, directions = 10, W = as.matrix(dist_df))
+```
+
+Testing weight matrix creation on entire (old) mouse data
+
+```{r}
+genom_x <- genomic_data %>% dplyr::select(-c("x", "y"))
+genom_coords <- genomic_data %>% dplyr::select(c("x", "y"))
+genom_labels <- meta[,7] %>% as.data.frame()
+
+slices <- length(unique(genom_labels[,1]))
+empty_df <- matrix(rep(0, slices^2), nrow = slices) %>% as.data.frame()
+
+for (i in 1:slices) {
+  for (j in 1:slices) {
+    x_dist <- genom_coords$x[i] - genom_coords$x[j]
+    y_dist <- genom_coords$y[i] - genom_coords$y[j]
+    dist_pair <- sqrt(x_dist^2 + y_dist^2)
+    empty_df[i,j] = dist_pair
+    empty_df[j,i] = dist_pair
+  }
+}
+dist_df <- 1 - empty_df / max(empty_df)
+min(dist_df)
+max(dist_df)
+
+genom_cells_d <- dist_df %>% as.matrix()
+
+sir_x_weighted <- categorical_sir(X = genom_x, Y = genom_labels, directions = 23, W = genom_cells_d)[[1]]
+
+sir_x_weighted
+
+fact_labels <- as.factor(genom_labels[,1])
+
+sir_svm <- svm(sir_x_weighted, fact_labels)
+sir_svm_resubbed_labels <- predict(sir_svm)
+correct_sir <- table(genom_labels[,1], sir_svm_resubbed_labels) %>% unclass() %>% diag() %>% sum()
+correct_sir/11026
+```
+
+#Function to create weight matrix
+
+This weight matrix is for categorical SIR, where coordinates are available.
+
+Needs: 
+  coordinates (as an n x 2 dataframe) with columns labelled "x" and "y",
+  labels (as an n x 1 dataframe)
+
+```{r}
+# weight matrix function was here, moved to sir_functions.R
+
+weight_mat <- cells_weight_matrix(coords = genom_coords, labels = genom_labels)
+weight_mat
+
+D <- sqrt(table(meta[,7])/11026) %>% diag()
+
+D %*% weight_mat %*% D ## Try using this as the weight matrix instead of just weight_mat in the CV SVM
+```
+
+PROBLEM with above: need to get the average coordinates of each celltype, before running the above distance calculator. 
+
+note: the correct ordering of the celltypes (needed for the matrix multiplication) is the order in which they appear: get that with unique(genom_labels[,1]).
+
+```{r}
+cells <- unique(labels[,1])
+test_coord <- matrix(c(1:18), nrow = 9) %>% as.data.frame()
+test_label <- matrix(c("a", "b", "c", "a", "b", "c", "a", "b", "c"), nrow = 9) %>% as.data.frame()
+test_coord
+test_label
+slicer(X = test_coord, Y = "no", allocation = test_label[,1], provided = TRUE)
+
+avg_locations <- slicer(X = genom_coords, Y = "no", allocation = genom_labels[,1], provided = TRUE)
+colnames(avg_locations) <- c("x", "y")
+cells_weight_matrix(coords = avg_locations, labels = genom_labels)
+```
+
+
+# Evaluating using weight matrix
+
+Here, we compare using weight matrix and not using. We use SIR to perform dimension reduction, then SVM to predict cell types. 
+
+With weight matrix
+
+```{r}
+start <- Sys.time()
+
+genom_x <- genomic_data %>% dplyr::select(-c("x", "y"))
+genom_coords <- genomic_data %>% dplyr::select(c("x", "y"))
+genom_labels <- meta[,7] %>% as.data.frame()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+n = nrow(genom_x)
+
+nrep <- 5
+npower <- 9
+
+for (i in 46:75) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  
+  power <- (i+2)%/%3
+  
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = genom_x[test_id, ]
+    X_train = genom_x[-test_id, ]
+    y_test = genom_labels[test_id,]
+    y_train = genom_labels[-test_id,]
+    coord_test = genom_coords[test_id, ]
+    coord_train = genom_coords[-test_id, ]
+    
+    weight_mat <- (cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23, W = weight_mat)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+cv_acc5_rtimes_test
+cv_acc5_rtimes_train
+
+wtest5 <- wtest5 %>% append(cv_acc5_rtimes_test)
+wtrain5 <- wtrain5 %>% append(cv_acc5_rtimes_train)
+
+#wtest <- wtest %>% append(cv_acc5_rtimes_test)
+#wtrain <- wtrain %>% append(cv_acc5_rtimes_train)
+
+#wtest_avgs <- wtest_avgs %>% append(c(mean(wtest[19:21]), mean(wtest[22:24]), mean(wtest[25:27])))
+#wtrain_avgs <- wtrain_avgs %>% append(c(mean(wtrain[19:21]), mean(wtrain[22:24]), mean(wtrain[25:27])))
+#wtest_avgs
+#wtrain_avgs
+
+
+test_list <- c(1,5,4,3,2)
+sort(test_list)
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+
+npower = 15
+
+all_accs_df5 <- matrix(NA, nrow = npower, ncol = nrep*2 + 3) %>% as.data.frame()
+colnames(all_accs_df5) <- c("power", "test_min", "test_second", "test_mid", "test_fourth", "test_max", "test_avg", "train_min","train_second", "train_mid", "train_fourth", "train_max", "train_avg")
+all_accs_df5$power <- c(1:npower)
+
+for (i in 1:npower) {
+  power <- i
+  current_trains <- c(wtrain5[5*i-4], wtrain5[5*i-3], wtrain5[5*i-2], wtrain5[5*i-1], wtrain5[5*i])
+  current_tests <- c(wtest5[5*i-4], wtest5[5*i-3], wtest5[5*i-2], wtest5[5*i-1], wtest5[5*i])
+  all_accs_df5$test_min[i] <- min(current_tests)
+  all_accs_df5$test_second[i] <- sort(current_tests)[2]
+  all_accs_df5$test_mid[i] <- median(current_tests)
+  all_accs_df5$test_fourth[i] <- sort(current_tests)[4]
+  all_accs_df5$test_max[i] <- max(current_tests)
+  all_accs_df5$test_avg[i] <- mean(current_tests)
+  all_accs_df5$train_min[i] <- min(current_trains)
+  all_accs_df5$train_second[i] <- sort(current_trains)[2]
+  all_accs_df5$train_mid[i] <- median(current_trains)
+  all_accs_df5$train_fourth[i] <- sort(current_trains)[4]
+  all_accs_df5$train_max[i] <- max(current_trains)
+  all_accs_df5$train_avg[i] <- mean(current_trains)
+}
+
+ggplot(all_accs_df5) +
+  geom_line(aes(x = power, y = test_min)) +
+  geom_line(aes(x = power, y = test_second)) +
+  geom_line(aes(x = power, y = test_mid)) +
+  geom_line(aes(x = power, y = test_fourth)) +
+  geom_line(aes(x = power, y = test_max)) +
+  geom_line(aes(x = power, y = test_avg), col = "blue") +
+  labs(x = "power", y = "test accuracy") +
+  geom_hline(yintercept = test_mean, col = "green4")
+
+ggplot(all_accs_df5) +
+  geom_line(aes(x = power, y = train_min)) +
+  geom_line(aes(x = power, y = train_second)) +
+  geom_line(aes(x = power, y = train_mid)) +
+  geom_line(aes(x = power, y = train_fourth)) +
+  geom_line(aes(x = power, y = train_max)) +
+  geom_line(aes(x = power, y = train_avg), col = "red") +
+  labs(x = "power", y = "train accuracy") +
+  geom_hline(yintercept = train_mean, col = "green4")
+
+
+### To these plots: add a horizontal line of accuracy when weight matrix is identity that is scaled by the number of cells of each type. 
+
+### Try much larger values of power, see when it goes down
+
+```
+
+Making a boxplot for the testing accuracy
+
+```{r}
+accs <- as.matrix(all_accs_df5[,2:6]) %>% as.vector()
+long_accs5 <- matrix(c(rep(c(1:15), 5), accs), ncol = 2) %>% as.data.frame()
+colnames(long_accs5) <- c("power", "accuracy")
+
+boxplot(accuracy~power, data = long_accs5, ylab = "test accuracy")
+
+plot(long_accs5$power, long_accs5$accuracy, xlab = "power", ylab = "test accuracy")
+abline(lm(accuracy~power, data = long_accs5), col = "blue")
+
+mat_test <- matrix(c(1:6), nrow = 2)
+as.vector(mat_test)
+mat_test
+```
+
+
+Without weight matrix
+
+```{r}
+start <- Sys.time()
+
+genom_x <- genomic_data %>% dplyr::select(-c("x", "y"))
+genom_labels <- meta[,7] %>% as.data.frame()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 8
+n = nrow(genom_x)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = genom_x[test_id, ]
+    X_train = genom_x[-test_id, ]
+    y_test = genom_labels[test_id,]
+    y_train = genom_labels[-test_id,]
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+test_mean <- cv_acc5_rtimes_test %>% mean()
+train_mean <- cv_acc5_rtimes_train %>% mean()
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+```
+
+# Function to create weight matrix: 
+
+# Week 1 Sem 2 Notes
+
+Be ready for final preso in week 9.
+
+Set out 1-2 weeks for writing, but get a draft done by week 9. 
+
+Up to midsem: get as many results as possible. 
+
+Start with a context and question, and demonstrate research from there: come up with question, take steps to get an answer, critique the answer I get, repeat. 
+
+Starting question: we have high-dim data (e.g but not limited to genomic). often we have potential to make use of the additional info that lies in the response variable(s). 
+
+Include final result (maybe that is using the weight matrix) in the abstract. maybe not in intro. 
+
+Research question: what is difference in quality with this approach
+
+Bad research is only like "I feel this won't work" anything else is probably good and worth including. 
+
+Application of methods in a novel context is novel research.
+
+Have ways to indicate in the thesis doc if something is a dot point or a final sentence. 
+
+Include figures: all plots, and the things we have each week on whiteboard. 
+
+Chapter 1: SIR
+subsection 1: how it works
+subsection 2: pros
+subsection 3: cons
+
+Cons include: no weight matrix 
+
+New method: incorporating weight 
+
+2: weights coming from the same data: distances between clusters/categories/slices
+3: what if we include more info like spatial, from which we can make our weight matrix. 
+
+Structure of thesis: it is about the form and structure of our Y: what about when it is multivariate and/or categorical and/or ordinal and/or discrete and/or continuous. 
+
+Idea: how stable is the method between the possible forms of Y. Also how stable is it under parameter choice: e.g slice number. 
+
+E.g chapter 2.1 could be motivating data, as could chapter 3.1 etc. differences could be that they have different Ys, although they are all high-dimensional.
+
+For each version of Y, also do a comparison between SIR to the best known DR method for that. These can all be introduced in a table of ticks for certain properties (as had on whiteboard once).
+
+want to show why having a weight matrix is a good idea. 
+
+A figure 1 is good: that talks about all the different versions of Y and how we may treat them, and what we've done. 
+
+Need data for the example of univariate continuous: could get some from dr package. Could use ais data for that. 
+
+Could use illustrator for figures in thesis. This automatically includes plots from R in the thesis doc with a link whenever I save a plot with ggsave. 
+
+Todo: set up dropbox for local overleaf documents. Set up premium (because of usyd) versions of miro, illustrator
+
+Eigenvalue issue:
+Don't want to keep very small eigenvalues. 
+SVM scales the variables to N(0,1) which is bad since it makes all variables equal. To counter this, we need to set scale = FALSE in the svm line of code. Want to do this whenever we've used SVM (and SIR or PCA), see if it improves things. 
+
+How many eigenvalues to keep: just look at how many are not too close to 0, keep as many as seems correct. 
+
+For the accuracies of SVM with the weight matrix: try fractional powers as well. For example, go from 1/12 up to 12 (use log powers for that).
+
+
+# Weight mat testing
+
+With weight matrix that is adjusted by number of cells in each cell type
+
+```{r}
+start <- Sys.time()
+
+D <- sqrt(table(meta[,7])/11026) %>% diag()
+
+D %*% cells_weight_matrix(coords = genom_coords, labels = genom_labels) %*% D
+
+genom_x <- genomic_data %>% dplyr::select(-c("x", "y"))
+genom_coords <- genomic_data %>% dplyr::select(c("x", "y"))
+genom_labels <- meta[,7] %>% as.data.frame()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+n = nrow(genom_x)
+
+nrep <- 5
+npower <- 2
+
+for (i in 1:(nrep*npower)) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  
+  power <- (i+4)%/%5
+  
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = genom_x[test_id, ]
+    X_train = genom_x[-test_id, ]
+    y_test = genom_labels[test_id,]
+    y_train = genom_labels[-test_id,]
+    coord_test = genom_coords[test_id, ]
+    coord_train = genom_coords[-test_id, ]
+    
+    weight_mat <- (cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power
+    
+    weight_mat_adj <- D %*% weight_mat %*% D
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23, W = weight_mat_adj)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+cv_acc5_rtimes_test
+cv_acc5_rtimes_train
+
+wtest5 <- cv_acc5_rtimes_test
+wtrain5 <- cv_acc5_rtimes_train
+
+#wtest <- wtest %>% append(cv_acc5_rtimes_test)
+#wtrain <- wtrain %>% append(cv_acc5_rtimes_train)
+
+#wtest_avgs <- wtest_avgs %>% append(c(mean(wtest[19:21]), mean(wtest[22:24]), mean(wtest[25:27])))
+#wtrain_avgs <- wtrain_avgs %>% append(c(mean(wtrain[19:21]), mean(wtrain[22:24]), mean(wtrain[25:27])))
+#wtest_avgs
+#wtrain_avgs
+
+
+test_list <- c(1,5,4,3,2)
+sort(test_list)
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+all_accs_df5_adj <- matrix(NA, nrow = npower, ncol = nrep*2 + 3) %>% as.data.frame()
+colnames(all_accs_df5_adj) <- c("power", "test_min", "test_second", "test_mid", "test_fourth", "test_max", "test_avg", "train_min","train_second", "train_mid", "train_fourth", "train_max", "train_avg")
+all_accs_df5_adj$power <- c(1:npower)
+
+for (i in 1:npower) {
+  power <- i
+  current_trains <- c(wtrain5[5*i-4], wtrain5[5*i-3], wtrain5[5*i-2], wtrain5[5*i-1], wtrain5[5*i])
+  current_tests <- c(wtest5[5*i-4], wtest5[5*i-3], wtest5[5*i-2], wtest5[5*i-1], wtest5[5*i])
+  all_accs_df5_adj$test_min[i] <- min(current_tests)
+  all_accs_df5_adj$test_second[i] <- sort(current_tests)[2]
+  all_accs_df5_adj$test_mid[i] <- median(current_tests)
+  all_accs_df5_adj$test_fourth[i] <- sort(current_tests)[4]
+  all_accs_df5_adj$test_max[i] <- max(current_tests)
+  all_accs_df5_adj$test_avg[i] <- mean(current_tests)
+  all_accs_df5_adj$train_min[i] <- min(current_trains)
+  all_accs_df5_adj$train_second[i] <- sort(current_trains)[2]
+  all_accs_df5_adj$train_mid[i] <- median(current_trains)
+  all_accs_df5_adj$train_fourth[i] <- sort(current_trains)[4]
+  all_accs_df5_adj$train_max[i] <- max(current_trains)
+  all_accs_df5_adj$train_avg[i] <- mean(current_trains)
+}
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = test_min)) +
+  geom_line(aes(x = power, y = test_second)) +
+  geom_line(aes(x = power, y = test_mid)) +
+  geom_line(aes(x = power, y = test_fourth)) +
+  geom_line(aes(x = power, y = test_max)) +
+  geom_line(aes(x = power, y = test_avg), col = "blue") +
+  labs(x = "power", y = "test accuracy")# +
+  #geom_hline(yintercept = test_mean, col = "green4")
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = train_min)) +
+  geom_line(aes(x = power, y = train_second)) +
+  geom_line(aes(x = power, y = train_mid)) +
+  geom_line(aes(x = power, y = train_fourth)) +
+  geom_line(aes(x = power, y = train_max)) +
+  geom_line(aes(x = power, y = train_avg), col = "red") +
+  labs(x = "power", y = "train accuracy")# +
+  #geom_hline(yintercept = train_mean, col = "green4")
+
+### To these plots: add a horizontal line of accuracy when weight matrix is identity that is scaled by the number of cells of each type. 
+
+```
+
+# 8 Aug notes
+
+slack file has which part of brain the brain cells are: use the same method as before with the W derived from the spatial locations. Might work better here as the centroids will be more spread out. This is task 1 see paper. Real problem better for this method.
+
+Try maybe get same number of cells of each type (so adjusting for size doesn't change it)
+Try also getting sample 2 (embryo 2) to get more data. Subset same method as described prev sentence). 
+
+See confusion matrix for the various DR methods on a simulated example. Not just accuracies. 
+Task 2 on the paper. simulation: see if appraoch works where we know the answer
+
+# Brain specific classification
+
+New data with 7 cells from within the brain (from 8 August)
+
+```{r}
+new <- readRDS("E8.5_mapped.brain_named.RDS")
+new_notNA <- na.omit(new)
+
+types <- setNames(new_notNA, NULL)
+ids <- names(new_notNA)
+braincell_df <- matrix(NA, ncol = 2, nrow = length(ids)) %>% as.data.frame()
+colnames(braincell_df) <- c("id", "celltype")
+braincell_df$id <- ids
+braincell_df$celltype <- types
+
+
+brain_cells <- brain_genomic_data
+brain_cells$id <- rownames(brain_cells)
+
+brain_cells <- merge(brain_cells, braincell_df, by = "id")
+brain_cells <- brain_cells %>% select(-c("celltype.x"))
+colnames(brain_cells)[length(colnames(brain_cells))] <- "celltype"
+brain_celltype <- as.data.frame(brain_cells$celltype)
+brain_genom <- as.data.frame(select(brain_cells, -c("x", "y", "id", "celltype")))
+brain_coords <- as.data.frame(select(brain_cells, c("x", "y")))
+```
+
+Without weight matrix
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 8
+n = nrow(brain_genom)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom[test_id, ]
+    X_train = brain_genom[-test_id, ]
+    y_test = brain_celltype[test_id,]
+    y_train = brain_celltype[-test_id,]
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+test_mean <- cv_acc5_rtimes_test %>% mean()
+train_mean <- cv_acc5_rtimes_train %>% mean()
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+train_mean
+test_mean
+```
+
+With weight matrix that is adjusted by number of cells in each cell type
+
+```{r}
+start <- Sys.time()
+
+weight_mat_brain <- cells_weight_matrix(coords = brain_coords, labels = brain_celltype)
+
+D <- sqrt(table(brain_celltype[,1])/length(brain_celltype[,1])) %>% diag()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+n = nrow(brain_genom)
+
+nrep <- 5
+npower <- 30
+
+for (i in 1:(nrep*npower)) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  
+  power <- (i+4)%/%5
+  
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom[test_id, ]
+    X_train = brain_genom[-test_id, ]
+    y_test = brain_celltype[test_id,]
+    y_train = brain_celltype[-test_id,]
+    coord_test = brain_coords[test_id, ]
+    coord_train = brain_coords[-test_id, ]
+    
+    weight_mat <- (cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power
+    
+    weight_mat_adj <- D %*% weight_mat %*% D
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23, W = weight_mat_adj)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+cv_acc5_rtimes_test
+cv_acc5_rtimes_train
+
+wtest5 <- cv_acc5_rtimes_test
+wtrain5 <- cv_acc5_rtimes_train
+
+#wtest <- wtest %>% append(cv_acc5_rtimes_test)
+#wtrain <- wtrain %>% append(cv_acc5_rtimes_train)
+
+#wtest_avgs <- wtest_avgs %>% append(c(mean(wtest[19:21]), mean(wtest[22:24]), mean(wtest[25:27])))
+#wtrain_avgs <- wtrain_avgs %>% append(c(mean(wtrain[19:21]), mean(wtrain[22:24]), mean(wtrain[25:27])))
+#wtest_avgs
+#wtrain_avgs
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+all_accs_df5_adj <- matrix(NA, nrow = npower, ncol = nrep*2 + 3) %>% as.data.frame()
+colnames(all_accs_df5_adj) <- c("power", "test_min", "test_second", "test_mid", "test_fourth", "test_max", "test_avg", "train_min","train_second", "train_mid", "train_fourth", "train_max", "train_avg")
+all_accs_df5_adj$power <- c(1:npower)
+
+for (i in 1:npower) {
+  power <- i
+  current_trains <- c(wtrain5[5*i-4], wtrain5[5*i-3], wtrain5[5*i-2], wtrain5[5*i-1], wtrain5[5*i])
+  current_tests <- c(wtest5[5*i-4], wtest5[5*i-3], wtest5[5*i-2], wtest5[5*i-1], wtest5[5*i])
+  all_accs_df5_adj$test_min[i] <- min(current_tests)
+  all_accs_df5_adj$test_second[i] <- sort(current_tests)[2]
+  all_accs_df5_adj$test_mid[i] <- median(current_tests)
+  all_accs_df5_adj$test_fourth[i] <- sort(current_tests)[4]
+  all_accs_df5_adj$test_max[i] <- max(current_tests)
+  all_accs_df5_adj$test_avg[i] <- mean(current_tests)
+  all_accs_df5_adj$train_min[i] <- min(current_trains)
+  all_accs_df5_adj$train_second[i] <- sort(current_trains)[2]
+  all_accs_df5_adj$train_mid[i] <- median(current_trains)
+  all_accs_df5_adj$train_fourth[i] <- sort(current_trains)[4]
+  all_accs_df5_adj$train_max[i] <- max(current_trains)
+  all_accs_df5_adj$train_avg[i] <- mean(current_trains)
+}
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = test_min)) +
+  geom_line(aes(x = power, y = test_second)) +
+  geom_line(aes(x = power, y = test_mid)) +
+  geom_line(aes(x = power, y = test_fourth)) +
+  geom_line(aes(x = power, y = test_max)) +
+  geom_line(aes(x = power, y = test_avg), col = "blue") +
+  labs(x = "power", y = "test accuracy") +
+  geom_hline(yintercept = test_mean, col = "green4")
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = train_min)) +
+  geom_line(aes(x = power, y = train_second)) +
+  geom_line(aes(x = power, y = train_mid)) +
+  geom_line(aes(x = power, y = train_fourth)) +
+  geom_line(aes(x = power, y = train_max)) +
+  geom_line(aes(x = power, y = train_avg), col = "red") +
+  labs(x = "power", y = "train accuracy") +
+  geom_hline(yintercept = train_mean, col = "green4")
+
+### Instead of adding the horizontal line: inside each CV fold run sir + svm without any weight matrix to get a more informative baseline, to get baseline using exactly the same data
+
+### Can calculate difference between baseline and powered accuracies for each power amount
+
+### also add in the accuracies for each cell type
+
+```
+
+Seeing what D (adjusted weight matrix) looks like.
+
+```{r}
+D <- sqrt(table(brain_celltype[,1])/length(brain_celltype[,1])) %>% diag()
+weight_unadj <- cells_weight_matrix(coords = brain_coords, labels = brain_celltype)
+weight_unadj
+weight_adj <- D %*% cells_weight_matrix(coords = brain_coords, labels = brain_celltype) %*% D
+D %*% weight_unadj^30 %*% D %>% round(5)
+D
+```
+
+One CV iteration, using only the brain cells in the right coordinates. 
+
+```{r}
+brain_coords_wo <- brain_coords[keep_index, ]
+brain_genom_wo <- brain_genom[keep_index, ]
+brain_celltype_wo <- brain_celltype[keep_index, ] %>% as.data.frame()
+
+D <- sqrt(table(brain_celltype_wo[,1])/length(brain_celltype_wo[,1])) %>% diag()
+
+n <- nrow(brain_genom_wo)
+cvK <- 5
+#cvSets = cvTools::cvFolds(n, cvK)
+
+power <- 10
+j <- 1
+test_id = cvSets$subsets[cvSets$which == j]
+X_test = brain_genom_wo[test_id, ]
+X_train = brain_genom_wo[-test_id, ]
+y_test = brain_celltype_wo[test_id,]
+y_train = brain_celltype_wo[-test_id,]
+coord_test = brain_coords_wo[test_id, ]
+coord_train = brain_coords_wo[-test_id, ]
+    
+weight_mat <- (cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power
+    
+weight_mat_adj <- D %*% solve(weight_mat) %*% D
+    
+Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 6, W = weight_mat_adj)
+Z_train <- Z_sir[[1]]
+#Z_train <- as.matrix(X_train) %*% Z_sir[[2]] same as above line
+Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+fit5 = svm(Z_train, factor(y_train))
+predicted_test <- predict(fit5, newdata = Z_test)
+predicted_train <- predict(fit5, newdata = Z_train)
+    
+cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+
+
+table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+
+table(predicted_test, y_test)
+table(predicted_train, y_train)
+
+#plot(Z_train[,1], Z_train[,2], col = as.factor(y_train)) # these show 2 dims, do UMAP/TSNE/pairsplot for more ddims 
+
+```
+
+
+```{r}
+keep_index = brain_coords$y < 0 & brain_coords$x < 1
+
+
+plot(brain_coords[keep_index,]$x, brain_coords[keep_index,]$y, col = factor(brain_celltype[keep_index,1]))
+abline(h = 0)
+abline(v = 1) #### filter out cells outside this box for the entire method: the rest are outliers
+points(x = centroids$V1, y = centroids$V2, pch = 16)
+
+centroids <- slicer(X = brain_coords[keep_index,], Y = 14, provided = TRUE, allocation = brain_celltype[keep_index,1])
+centroids
+unique(brain_celltype[keep_index,1])
+
+
+brain_coord_wo
+
+solve(weight_mat)
+
+```
+
+
+Plot along SIR1 and SIR2, see how they look there - if separate, if dominated by SIR1, etc, 
+plot SIR1 and SIR2
+
+
+When is W good: when there is a small diff in x but large diff in location: study in simulate.
+this makes them more different - maybe this should be priority not bring together close celltypes?
+
+Try get rid of all cells whose distance to their centroid >= some distance parameter
+Is centroid even good? Maybe minimum distances between celltypes a and b, or maximum, is better. Do simulation to see this. 
+
+Maybe adding W just makes predicting yellow better? it is the only one with distinct position. 
+
+# CASE 2: Simulation
+
+Simulated data that works well for this version of a weight matrix
+
+```{r}
+# Don't run this chunk again (want to keep the same UMAP for the simulation)
+library(umap)
+umap_vals <- umap(genom_x)
+```
+
+
+```{r}
+umap_clusters <- kmeans(x = umap_vals[[1]], centers = 4)
+plot(umap_vals[[1]][,1], umap_vals[[1]][,2], col = umap_clusters$cluster) # cluster on this to find celltypes to simulate
+
+# make some parameter to control level of separation of groups 1 and 4 in the X
+for (i in 1:4) {
+  x = mean(umap_vals[[1]][,1][umap_clusters$cluster == i])
+  y = mean(umap_vals[[1]][,2][umap_clusters$cluster == i])
+  print(c(x,y))
+}
+```
+
+
+From above loop: cluster 1 is furthest left,
+cluster 2 is top right
+cluster 3 is bottom right 
+cluster 4 is middle right
+
+Want to entirely preserve clusters 1 and 3, slowly mix up clusters 2 and 4.
+
+Swapper function: (swaps celltypes according to some probability)
+
+```{r}
+swapper <- function(cluster, p) { # p = probability of swapping
+  vals <- c(2,4)
+  position = match(cluster, vals)
+  if (position == 1) {
+    sampled = sample(vals, size = 1, prob = c(1-p, p))
+  } else {
+    sampled = sample(vals, size = 1, prob = c(p, 1-p))
+  }
+  return(sampled)
+}
+```
+
+Getting the new celltypes:
+(and plotting)
+
+```{r}
+p = 0
+
+clusters = setNames(umap_clusters$cluster, NULL)
+for (i in 1:length(clusters)) {
+  cluster = clusters[i]
+  if (cluster == 2) {
+    clusters[i] <- swapper(cluster = cluster, p = p)
+  }
+  if (cluster == 4) {
+    clusters[i] <- swapper(cluster = cluster, p = p)
+  }
+}
+
+plot(umap_vals[[1]][,1], umap_vals[[1]][,2], col = clusters)
+```
+
+Getting new x and y coords
+
+```{r}
+y_vals <- runif(nrow(genom_x), 0, 1)
+
+sizes <- setNames(table(clusters), NULL)
+#original_clusters
+
+# Below ordering because we want clusters 2 and 4 far apart in space
+x_vals_1 <- runif(sizes[2], 0, 1)
+x_vals_2 <- runif(sizes[1], 1, 2)
+x_vals_3 <- runif(sizes[3], 2, 3)
+x_vals_4 <- runif(sizes[4], 3, 4)
+
+x1 = x2 = x3 = x4 = 1
+x_vals <- rep(length(clusters), 0)
+
+for (i in 1:length(clusters)) {
+  cl = clusters[i]
+  if (cl == 1) {
+    x_vals[i] = x_vals_1[x1] %>% as.numeric()
+    x1 = x1 + 1
+  }
+  if (cl == 2) {
+    x_vals[i] = x_vals_2[x2] %>% as.numeric()
+    x2 = x2 + 2
+  }
+  if (cl == 3) {
+    x_vals[i] = x_vals_3[x3] %>% as.numeric()
+    x3 = x3 + 3
+  }
+  if (cl == 4) {
+    x_vals[i] = x_vals_4[x4] %>% as.numeric()
+    x4 = x4 + 4
+  }
+}
+plot(x_vals, y_vals, col = clusters)
+
+sim_coords <- cbind(x_vals, y_vals) %>% as.data.frame()
+colnames(sim_coords) <- c("x", "y")
+sim_genom <- genom_x
+sim_celltypes <- as.character(clusters) %>% as.data.frame()
+colnames(sim_celltypes) <- c("celltype")
+```
+
+Running SIR on above coords, genom and celltypes
+
+```{r}
+D <- sqrt(table(sim_celltypes[,1])/length(sim_celltypes[,1])) %>% diag()
+
+n <- nrow(sim_genom)
+cvK <- 5
+#cvSets = cvTools::cvFolds(n, cvK)
+
+power <- 10
+j <- 3
+test_id = cvSets$subsets[cvSets$which == j]
+X_test = sim_genom[test_id, ]
+X_train = sim_genom[-test_id, ]
+y_test = sim_celltypes[test_id,]
+y_train = sim_celltypes[-test_id,]
+coord_test = sim_coords[test_id, ]
+coord_train = sim_coords[-test_id, ]
+    
+weight_mat <- (cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power
+    
+weight_mat_adj <- D %*% solve(weight_mat) %*% D
+    
+Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 3, W = weight_mat_adj)
+Z_train <- Z_sir[[1]]
+#Z_train <- as.matrix(X_train) %*% Z_sir[[2]] same as above line
+Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+fit5 = svm(Z_train, factor(y_train))
+predicted_test <- predict(fit5, newdata = Z_test)
+predicted_train <- predict(fit5, newdata = Z_train)
+    
+cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+
+
+table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+
+table(predicted_test, y_test)
+table(predicted_train, y_train)
+
+#plot(Z_train[,1], Z_train[,2], col = as.factor(y_train)) # these show 2 dims, do UMAP/TSNE/pairsplot for more ddims 
+
+sir <- categorical_sir(X = sim_genom, Y = as.data.frame(sim_celltypes), directions = 3)[[1]]
+plot(sir[,2], sir[,3], col = clusters)
+
+weight_mat = cells_weight_matrix(coords = sim_coords, labels = as.data.frame(sim_celltypes))
+weight_mat
+sim_celltypes
+brain_celltype
+
+weight_mat_brain <- cells_weight_matrix(coords = brain_coords, labels = as.data.frame(brain_celltype))
+weight_mat_brain
+
+brain_coords
+
+length(unique(sim_celltypes[,1]))
+
+
+cells_weight_matrix(coords = sim_coords, labels = as.data.frame(meta[,7]))
+```
+
+
+
+
+
+
+
+
+
+```{r}
+cells_weight_matrix <- function(coords, labels) {
+  slices <- length(unique(labels[,1]))
+  empty_df <- matrix(rep(0, slices^2), nrow = slices) %>% as.data.frame()
+  
+  avg_locations <- slicer(X = coords, Y = "no", allocation = labels[,1], provided = TRUE)
+  colnames(avg_locations) <- c("x", "y")
+  
+  for (i in 1:slices) {
+    for (j in 1:slices) {
+      x_dist <- avg_locations$x[i] - avg_locations$x[j]
+      y_dist <- avg_locations$y[i] - avg_locations$y[j]
+      dist_pair <- sqrt(x_dist^2 + y_dist^2)
+      empty_df[i,j] = dist_pair
+      empty_df[j,i] = dist_pair
+    }
+  }
+  dist_df <- 1 - empty_df / max(empty_df)
+  weight_mat <- dist_df %>% as.matrix()
+  return(weight_mat)
+}
+
+coords = sim_coords
+labels <- sim_celltypes
+slices <- length(unique(labels[,1]))
+empty_df <- matrix(rep(0, slices^2), nrow = slices) %>% as.data.frame()
+avg_locations <- slicer(X = coords, Y = "no", allocation = labels[,1], provided = TRUE)
+colnames(avg_locations) <- c("x", "y")
+avg_locations
+
+table(sim_celltypes[,1])
+for (i in 1:slices) {
+  for (j in 1:slices) {
+    x_dist <- avg_locations$x[i] - avg_locations$x[j]
+    y_dist <- avg_locations$y[i] - avg_locations$y[j]
+    dist_pair <- sqrt(x_dist^2 + y_dist^2)
+    empty_df[i,j] = dist_pair
+    empty_df[j,i] = dist_pair
+  }
+}
+dist_df <- 1 - empty_df / max(empty_df)
+weight_mat <- dist_df %>% as.matrix()
+weight_mat
+
+brain_coords
+sim_coords
+brain_celltype
+sim_celltypes
+```
+
+```{r}
+X <- X %>% as.data.frame()
+if (!provided) {
+  data <- sorter(X, Y)
+  data$slice <- allocator(X, slices = slices)
+} else {
+  data <- X %>% as.data.frame()
+  data$slice <- allocation
+  data <- data %>% arrange(slice)
+  slices <- length(unique(allocation))
+}
+  
+slice_names <- unique(data$slice) # need this change so that it works when we have slice names as tile coords
+  
+long_values_sliced_dataframe <- c()
+  
+for (s in 1:slices) { 
+  for (i in 1:nrow(data)) {
+    if (data$slice[i] == slice_names[s]) {
+      first_row <- i
+      break
+    }
+  }
+  for (i in 1:nrow(data)) {
+    if (data$slice[i] == slice_names[s]) {
+      last_row <- i
+    }
+  }
+  dataset_for_avging <- data[first_row:last_row,1:ncol(X)]
+  avgs <- means(dataset_for_avging)
+  long_values_sliced_dataframe <- long_values_sliced_dataframe %>% append(avgs)
+}
+sliced_dataset <- matrix(long_values_sliced_dataframe, ncol = ncol(X), byrow = TRUE) %>% as.data.frame()
+#rownames(sliced_dataset) <- c(1:slices)
+return(sliced_dataset)
+```
+
+# 22 Aug Notes
+
+Should do slicing, prediction and weighting all on same quantity (pick location or celltype - not both)
+
+See board photo: slice on tile_interaction_cluster to predict tile. This makes more sense to be consistent. 
+
+Can be creative with making a weight matrix: can use hierarchical clustering to find similiarities. Remember the goal is to tell SIR that tiles 1 and 2 are close, so should be predicted together (it won't know otherwise). 
+
+Using spatial info and gene expression is better to use since it is more trustworthy. Also celltype may be redundant as it is a function of gene expression and spatial info anyway. 
+
+More graphs 
+
+# Tile slicing, weighting and prediction
+
+Goal here: use tile (from spatial) for everything.
+
+## Spatial slicing
+
+```{r}
+keep_index = brain_coords$y < 0 & brain_coords$x < 1
+brain_coords_wo <- brain_coords[keep_index, ]
+brain_genom_wo <- brain_genom[keep_index, ]
+brain_celltype_wo <- brain_celltype[keep_index, ] %>% as.data.frame()
+
+brain_sir <- spatial_sir(X = brain_genom_wo, coords = brain_coords_wo, slices = 2, directions = 8)
+
+brain_allocation <- spatial_allocator(X = brain_genom_wo, coords = brain_coords_wo, slices = 3)
+
+brain_tiles <- factor(brain_allocation$coordinate) %>% as.data.frame()
+colnames(brain_tiles) <- c("tile")
+
+plot(brain_coords_wo$x, brain_coords_wo$y, col = brain_tiles[,1])
+```
+
+## CV without any weight matrix
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 4
+n = nrow(brain_genom_wo)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom_wo[test_id, ]
+    X_train = brain_genom_wo[-test_id, ]
+    y_test = brain_tiles[test_id,]
+    y_train = brain_tiles[-test_id,]
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+test_mean_tile <- cv_acc5_rtimes_test %>% mean()
+train_mean_tile <- cv_acc5_rtimes_train %>% mean()
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+train_mean_tile
+test_mean_tile
+```
+
+## Weight matrix: Distance to centroids then CV
+
+```{r}
+tiles_weight_centroid <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles)
+
+W_new = (tiles_weight_centroid*2) - 1
+# 
+# W_tmp = tiles_weight_centroid
+# w_vals = W_tmp[lower.tri(W_tmp)]
+# 
+# hist(w_vals)
+# 
+# w_vals_new <- w_vals*2 - 1
+# hist(w_vals_new)
+# plot(w_vals_new,w_vals)
+# W_new <- W_tmp
+# W_new[lower.tri(W_new)] <- w_vals_new
+# 
+# plot(W_new[lower.tri(W_new)], w_vals_new)
+```
+
+Using a certain power of centroid weighting
+
+```{r}
+start <- Sys.time()
+
+D <- sqrt(table(brain_tiles[,1])/length(brain_tiles[,1])) %>% diag()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+n = nrow(brain_genom_wo)
+
+nrep <- 5
+npower <- 5
+
+for (i in 1:(nrep*npower)) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  
+  power <- (i+4)%/%5
+  
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom_wo[test_id, ]
+    X_train = brain_genom_wo[-test_id, ]
+    y_test = brain_tiles[test_id,]
+    y_train = brain_tiles[-test_id,]
+    coord_test = brain_coords_wo[test_id, ]
+    coord_train = brain_coords_wo[-test_id, ]
+    
+    
+    tiles_weight_centroid_cv <- ((cells_weight_matrix(coords = coord_train, labels = as.data.frame(y_train)))^power)*2 - 1
+    
+    weight_mat_adj <- D %*% tiles_weight_centroid_cv %*% D
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23, W = weight_mat_adj)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+cv_acc5_rtimes_test
+cv_acc5_rtimes_train
+
+
+wtest5 <- cv_acc5_rtimes_test
+wtrain5 <- cv_acc5_rtimes_train
+
+#wtest <- wtest %>% append(cv_acc5_rtimes_test)
+#wtrain <- wtrain %>% append(cv_acc5_rtimes_train)
+
+#wtest_avgs <- wtest_avgs %>% append(c(mean(wtest[19:21]), mean(wtest[22:24]), mean(wtest[25:27])))
+#wtrain_avgs <- wtrain_avgs %>% append(c(mean(wtrain[19:21]), mean(wtrain[22:24]), mean(wtrain[25:27])))
+#wtest_avgs
+#wtrain_avgs
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+all_accs_df5_adj <- matrix(NA, nrow = npower, ncol = nrep*2 + 3) %>% as.data.frame()
+colnames(all_accs_df5_adj) <- c("power", "test_min", "test_second", "test_mid", "test_fourth", "test_max", "test_avg", "train_min","train_second", "train_mid", "train_fourth", "train_max", "train_avg")
+all_accs_df5_adj$power <- c(1:npower)
+
+for (i in 1:npower) {
+  power <- i
+  current_trains <- c(wtrain5[5*i-4], wtrain5[5*i-3], wtrain5[5*i-2], wtrain5[5*i-1], wtrain5[5*i])
+  current_tests <- c(wtest5[5*i-4], wtest5[5*i-3], wtest5[5*i-2], wtest5[5*i-1], wtest5[5*i])
+  all_accs_df5_adj$test_min[i] <- min(current_tests)
+  all_accs_df5_adj$test_second[i] <- sort(current_tests)[2]
+  all_accs_df5_adj$test_mid[i] <- median(current_tests)
+  all_accs_df5_adj$test_fourth[i] <- sort(current_tests)[4]
+  all_accs_df5_adj$test_max[i] <- max(current_tests)
+  all_accs_df5_adj$test_avg[i] <- mean(current_tests)
+  all_accs_df5_adj$train_min[i] <- min(current_trains)
+  all_accs_df5_adj$train_second[i] <- sort(current_trains)[2]
+  all_accs_df5_adj$train_mid[i] <- median(current_trains)
+  all_accs_df5_adj$train_fourth[i] <- sort(current_trains)[4]
+  all_accs_df5_adj$train_max[i] <- max(current_trains)
+  all_accs_df5_adj$train_avg[i] <- mean(current_trains)
+}
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = test_min)) +
+  geom_line(aes(x = power, y = test_second)) +
+  geom_line(aes(x = power, y = test_mid)) +
+  geom_line(aes(x = power, y = test_fourth)) +
+  geom_line(aes(x = power, y = test_max)) +
+  geom_line(aes(x = power, y = test_avg), col = "blue") +
+  labs(x = "power", y = "test accuracy") +
+  geom_hline(yintercept = test_mean_tile, col = "green4")
+
+ggplot(all_accs_df5_adj) +
+  geom_line(aes(x = power, y = train_min)) +
+  geom_line(aes(x = power, y = train_second)) +
+  geom_line(aes(x = power, y = train_mid)) +
+  geom_line(aes(x = power, y = train_fourth)) +
+  geom_line(aes(x = power, y = train_max)) +
+  geom_line(aes(x = power, y = train_avg), col = "red") +
+  labs(x = "power", y = "train accuracy") +
+  geom_hline(yintercept = train_mean_tile, col = "green4")
+```
+
+## Weight matrix: Adjacent tiles
+
+Making weight matrix
+
+Method: not directly looking at adjacent tiles. Use previous weight matrix, and make each entry a 1 if > 0.5, otherwise a 0
+
+```{r}
+start <- Sys.time()
+
+## Making weight matrix
+
+thresholds = c(-4:5)/5
+test_accs = rep(NA,10)
+train_accs = rep(NA,10)
+for (k in 1:(length(thresholds))) {
+  tiles_weight_thres = tiles_weight_centroid
+  
+  threshold = thresholds[k]
+
+  for (i in 1:nrow(tiles_weight_centroid)) {
+    for (j in 1:ncol(tiles_weight_centroid)) {
+      val = tiles_weight_centroid[i,j]
+      if (val >= threshold) {
+        tiles_weight_thres[i,j] = 1
+      } else{
+        tiles_weight_thres[i,j] = -1
+      }
+    }
+  }
+  if(threshold == 0.4) {
+    adj_mat <- tiles_weight_thres
+  }
+
+  ## Performing CV starts here
+
+  cvK = 5  # number of CV folds
+  cv_acc5_rtimes_train = cv_acc5_train = c()
+  cv_acc5_rtimes_test = cv_acc5_test = c()
+  r = 4
+  n = nrow(brain_genom_wo)
+  
+  if (k == length(thresholds)+1){
+    tiles_weight_thres = tiles_weight_centroid
+  }
+
+  for (i in 1:r) {
+    if (i %% 10 == 0) {
+      print(i)
+    }
+    cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+    cv_acc5_test = NA  # initialise results vector
+    cv_acc5_train = NA  # initialise results vector
+    for (j in 1:cvK) {
+      test_id = cvSets$subsets[cvSets$which == j]
+      X_test = brain_genom_wo[test_id, ]
+      X_train = brain_genom_wo[-test_id, ]
+      y_test = brain_tiles[test_id,]
+      y_train = brain_tiles[-test_id,]
+    
+      Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 8, W = as.matrix(tiles_weight_thres))
+      Z_train <- Z_sir[[1]]
+      Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+      #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+      fit5 = svm(Z_train, factor(y_train))
+      predicted_test <- predict(fit5, newdata = Z_test)
+      predicted_train <- predict(fit5, newdata = Z_train)
+    
+      cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+      cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+    }
+    cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+    cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+  }
+  test_mean_thres <- cv_acc5_rtimes_test %>% mean()
+  train_mean_thres <- cv_acc5_rtimes_train %>% mean()
+  test_accs[k] <- test_mean_thres
+  train_accs[k] <- train_mean_thres
+}
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+adj_acc_df <- matrix(NA, nrow = 10, ncol = 3) %>% as.data.frame()
+colnames(adj_acc_df ) <- c("threshold", "train_acc", "test_acc")
+adj_acc_df$threshold <- thresholds[1:10]
+adj_acc_df$train_acc <- train_accs
+adj_acc_df$test_acc <- test_accs
+
+#plot(x = thresholds, y = train_accs, col = "red")#
+#plot(x = thresholds, y = test_accs, col = "blue")
+
+#test_accs[10]
+#train_accs[10]
+
+adj_mat %>% as.data.frame() %>% gt()
+
+# normal weight matrix, different alphas
+
+test_accs = rep(NA,10)
+train_accs = rep(NA,10)
+
+for (k in 1:(length(thresholds))) {
+
+  ## Performing CV starts here
+
+  cvK = 5  # number of CV folds
+  cv_acc5_rtimes_train = cv_acc5_train = c()
+  cv_acc5_rtimes_test = cv_acc5_test = c()
+  r = 4
+  n = nrow(brain_genom_wo)
+
+  for (i in 1:r) {
+    if (i %% 10 == 0) {
+      print(i)
+    }
+    cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+    cv_acc5_test = NA  # initialise results vector
+    cv_acc5_train = NA  # initialise results vector
+    for (j in 1:cvK) {
+      test_id = cvSets$subsets[cvSets$which == j]
+      X_test = brain_genom_wo[test_id, ]
+      X_train = brain_genom_wo[-test_id, ]
+      y_test = brain_tiles[test_id,]
+      y_train = brain_tiles[-test_id,]
+      X_coords <- brain_coords_wo[-test_id,]
+      
+      weight_mat <- cells_weight_matrix(coords = X_coords, labels = as.data.frame(y_train), power = k)
+    
+      Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 8, W = as.matrix(weight_mat))
+      Z_train <- Z_sir[[1]]
+      Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+      #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+      fit5 = svm(Z_train, factor(y_train))
+      predicted_test <- predict(fit5, newdata = Z_test)
+      predicted_train <- predict(fit5, newdata = Z_train)
+    
+      cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+      cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+    }
+    cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+    cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+  }
+  test_mean_thres <- cv_acc5_rtimes_test %>% mean()
+  train_mean_thres <- cv_acc5_rtimes_train %>% mean()
+  test_accs[k] <- test_mean_thres
+  train_accs[k] <- train_mean_thres
+}
+
+w_acc_df <- matrix(NA, nrow = 10, ncol = 3) %>% as.data.frame()
+colnames(w_acc_df ) <- c("alpha", "train_acc", "test_acc")
+w_acc_df$alpha <- c(1:10)
+w_acc_df$train_acc <- train_accs
+w_acc_df$test_acc <- test_accs
+
+w_acc_df
+adj_acc_df
+
+ggplot(adj_acc_df, aes(x = threshold, y = test_acc)) +
+  geom_line(col = "#e64626") +
+  theme_classic() +
+  labs(x = "Threshold", y = "Test Accuracy") +
+  ggtitle("Test Set Accuracy for Different Threshold") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(w_acc_df, aes(x = alpha, y = test_acc)) +
+  geom_line(col = "#e64626") +
+  theme_classic() +
+  labs(x = "Alpha", y = "Test Accuracy") +
+  ggtitle("Test Set Accuracy for Different Alpha") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+w_method_test_accs 
+```
+
+# 29 Aug Notes
+
+need to tell a story in any preso
+DR -> sufficient DR -> SIR -> weights
+
+Want to show some results, but good ones (so don't do the ones where slicing on place, predicting cell type)
+
+Less is more, present the most interesting things.
+
+From here down: on progress
+
+add PCA as a comparison, just to confirm SIR superior 
+
+Also do predicting tile, while slicing on cell type and tile. Weight matrix based on distances (or some other way based on location).
+
+Try random forest instead of svm for the actual model. Trees instead of bubbles could be better
+Will want to have many ML methods
+
+Try changing number of directions
+
+Do better version of acc: not just 0 if wrong, 1 if correct: need 0.8 if in an adjacent tile 
+
+Try kmeans clustering, then ARI to use a more truthful number of categories/clusters
+
+Will be better if clustering see above 
+
+For a presented result: don't show a range of powers, just pick the best one and show that is the weighted SIR result. Compare together PCA, SIR, weighted SIR, also see how the tiles look. 
+
+Weight matrix: isntead of scaling to U(0,1), try scaling to U(-1,1) (like the correlation coefficient). 
+
+Organise this whole .rmd file into embryo data rmd and brain data rmd
+Want to make quite a few smaller .rmd files, so that there isn't interference between different parts and also for faster runtime. Also a .rmd for downloading and saving the mouse data.
+
+Write up the the CV chunk as a function to save space and be consistent. 
+
+Use "..." when making functions.
+
+Extra meet 11.30am this Thursday 31 Aug
+
+```{r}
+library(plotly)
+g = qplot(Z_train[,1], Z_train[,2], col = factor(y_train))
+# do this as a 3D with Z_train[,1:3]
+
+ggplotly(g) # cluster on that then ARI with tiles. kmeans good, see how it is with varying num clust. (choose highest)
+```
+
+```{r}
+?apply
+
+new_fun <- function(x, y, ...) {
+  
+}
+```
+
+Tasks:
+
+organise .rmd
+
+perform PCA
+
+perform RF
+
+implement new accuracy
+
+implement clustering
+
+make functions
+
+```{r}
+new_weight_mat <- function(old_mat) {
+  return(old_mat*2 - 1)
+}
+
+
+```
+
+
+
+```{r}
+start <- Sys.time()
+
+cvK = 4  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 1
+n = nrow(brain_genom_wo)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom_wo[test_id, ]
+    X_train = brain_genom_wo[-test_id, ]
+    y_test = brain_tiles[test_id,]
+    y_train = brain_tiles[-test_id,]
+    
+    Z_pca <- prcomp(X_train, center = FALSE) # do same numb of dims
+    Z_train <- Z_pca$x[,1:8]
+    Z_test <- as.matrix(X_test) %*% Z_pca$rotation[,1:8] # there will be somethi g eelse to do here
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+test_mean_pca <- cv_acc5_rtimes_test %>% mean()
+train_mean_pca <- cv_acc5_rtimes_train %>% mean()
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+train_mean_pca
+test_mean_pca
+```
+
+
+
+```{r}
+?prcomp
+
+plot(Z_pca$x[,2:3], col = factor(y_train))
+
+dist_pca <- dist(Z_pca$x)
+
+dim(dist_pca)
+
+coords_train <- brain_coords_wo[-test_id,]
+spatial_dist <- coords_train %>% dist()
+dim(spatial_dist)
+
+smoothScatter(c(as.matrix(dist_pca[lower.tri(dist_pca)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])))
+
+cor(c(as.matrix(dist_pca[lower.tri(dist_pca)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+
+
+
+```
+
+# Work from 31 Aug
+
+Tasks: plotting spatial coords, PCA 2v3, SIR 1v2, wSIR 1v2
+No need for subsetting data
+
+```{r}
+plot(brain_coords_wo[,1:2], col = as.factor(brain_tiles[,1]), main = "True coords and tiles") # or brain_celltype_wo[,1]
+
+brain_sir <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 8)
+
+plot(brain_sir[[1]][,1:2], col = as.factor(brain_tiles[,1]), main = "SIR and tiles")
+
+#plot(brain_sir[[1]][,1:2], col = as.factor(brain_celltype_wo[,1]), main = "SIR and celltypes")
+
+weight_mat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles, power = 9)
+
+brain_sir_w <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 8, W = weight_mat)
+plot(brain_sir_w[[1]][,1:2], col = as.factor(brain_tiles[,1]), main = "WSIR and tiles")
+
+pc_brain <- prcomp(brain_genom_wo)$x
+plot(pc_brain[,2:3], col = as.factor(brain_tiles[,1]), main = "PCA and tiles")
+
+brain3x3_df <- matrix(NA, nrow = length(brain_tiles[,1]), ncol = 9) %>% as.data.frame()
+colnames(brain3x3_df) <- c("tile", "x", "y", "sir1", "sir2", "wsir1", "wsir2", "pc2", "pc3")
+brain3x3_df$tile <- brain_tiles[,1]
+brain3x3_df$x <- brain_coords_wo$x
+brain3x3_df$y <- brain_coords_wo$y
+brain3x3_df$sir1 <- brain_sir[[1]][,1]
+brain3x3_df$sir2 <- brain_sir[[1]][,2]
+brain3x3_df$wsir1 <- brain_sir_w[[1]][,1]
+brain3x3_df$wsir2 <- brain_sir_w[[1]][,2]
+brain3x3_df$pc2 <- pc_brain[,2]
+brain3x3_df$pc3 <- pc_brain[,3]
+```
+
+
+```{r}
+brain_sir_12 <- brain_sir[[1]][,1:2]
+brain_wsir_12 <- brain_sir_w[[1]][,1:2]
+brain_pca_12 <- pc_brain[,1:10]
+
+fviz_nbclust(brain_sir_12, kmeans, method = "silhouette", k.max = 7)
+fviz_nbclust(brain_wsir_12, kmeans, method = "silhouette", k.max = 7)
+fviz_nbclust(brain_pca_12, kmeans, method = "silhouette", k.max = 7)
+
+brain_sir_kmns <- kmeans(brain_sir_12, centers = 3)$cluster
+brain_wsir_kmns <- kmeans(brain_wsir_12, centers = 3)$cluster
+brain_pca_kmns <- kmeans(brain_pca_12, centers = 3)$cluster
+
+print("ARIs")
+
+ari_sir <- adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns)
+ari_wsir <- adjustedRandIndex(x = brain_tiles[,1], y = brain_wsir_kmns)
+ari_pca <- adjustedRandIndex(x = brain_tiles[,1], y = brain_pca_kmns)
+
+spatial_dist <- brain_coords_wo %>% dist()
+
+dist_sir <- dist(brain_sir_12)
+dist_wsir <- dist(brain_wsir_12)
+dist_pca <- dist(brain_pca_12)
+
+print("Cors")
+
+cor(c(as.matrix(dist_sir[lower.tri(dist_sir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+cor(c(as.matrix(dist_wsir[lower.tri(dist_wsir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+cor(c(as.matrix(dist_pca[lower.tri(dist_pca)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+
+print("ARIs, cors for powers 1:10")
+
+for (i in 1:10) {
+  weight_mat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles, power = i)
+  brain_sir_w <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 8, W = weight_mat)
+  brain_wsir_12 <- brain_sir_w[[1]][,1:2]
+  brain_wsir_kmns <- kmeans(brain_wsir_12, centers = 3)$cluster
+  ari = adjustedRandIndex(x = brain_tiles[,1], y = brain_wsir_kmns)
+  dist_wsir <- dist(brain_wsir_12)
+  cor = cor(c(as.matrix(dist_wsir[lower.tri(dist_wsir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+  print(c(ari, cor))
+}
+
+ari_df <- matrix(NA, nrow = 3, ncol = 2) %>% as.data.frame()
+colnames(ari_df) <- c("Method", "ARI")
+ari_df$Method <- c("SIR", "wSIR", "PCA")
+ari_df$ARI <- c(ari_sir, ari_wsir, ari_pca)
+ari_df
+
+ggplot(ari_df, aes(x = Method, y = ARI)) + 
+  geom_bar(stat="identity", fill = "#e64626", width = 0.3, color = "black") +
+  ggtitle("ARI between plot clusters and true tiles per method") +
+  geom_text(aes(label = round(ARI, 3)), vjust=-0.3, size=3.5) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        axis.text.x = element_text(size = 12, color = "black"))
+```
+
+```{r}
+adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns)
+adjustedRandIndex(x = brain_tiles[,1], y = brain_pca_kmns)
+```
+
+# Using 4x4 slices
+
+```{r}
+brain_allocation4 <- spatial_allocator(X = brain_genom_wo, coords = brain_coords_wo, slices = 4)
+
+brain_tiles4 <- factor(brain_allocation4$coordinate) %>% as.data.frame()
+colnames(brain_tiles4) <- c("tile")
+
+plot(brain_coords_wo$x, brain_coords_wo$y, col = brain_tiles4[,1])
+
+brain_sir4 <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 8)
+
+plot(brain_sir4[[1]][,1:2], col = as.factor(brain_tiles4[,1]), main = "SIR and tiles")
+
+#plot(brain_sir[[1]][,1:2], col = as.factor(brain_celltype_wo[,1]), main = "SIR and celltypes")
+
+weight_mat4 <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles4, power = 5)
+brain_sir_w4 <- categorical_sir(X = brain_genom_wo, Y = brain_tiles4, directions = 8, W = weight_mat4)
+plot(brain_sir_w4[[1]][,1:2], col = as.factor(brain_tiles4[,1]), main = "WSIR and tiles")
+
+pc_brain4 <- prcomp(brain_genom_wo)$x
+plot(pc_brain4[,2:3], col = as.factor(brain_tiles4[,1]), main = "PCA and tiles")
+```
+
+```{r}
+brain_sir4_12 <-brain_sir4[[1]][,1:2]
+brain_wsir4_12 <- brain_sir_w4[[1]][,1:2]
+brain_pca4_12 <- pc_brain4[,1:2]
+
+fviz_nbclust(brain_sir4_12, kmeans, method = "silhouette", k.max = 10)
+fviz_nbclust(brain_wsir4_12, kmeans, method = "silhouette", k.max = 10)
+fviz_nbclust(brain_pca4_12, kmeans, method = "silhouette", k.max = 10)
+
+brain_sir_kmns4 <- kmeans(brain_sir4_12, centers = 3)$cluster
+brain_wsir_kmns4 <- kmeans(brain_wsir4_12, centers = 3)$cluster
+brain_pca_kmns4 <- kmeans(brain_pca4_12, centers = 3)$cluster
+
+print("ARIs:")
+
+adjustedRandIndex(x = brain_tiles4[,1], y = brain_sir_kmns4)
+adjustedRandIndex(x = brain_tiles4[,1], y = brain_wsir_kmns4)
+adjustedRandIndex(x = brain_tiles4[,1], y = brain_pca_kmns4)
+
+spatial_dist <- brain_coords_wo %>% dist()
+
+dist_sir <- dist(brain_sir4_12)
+dist_wsir <- dist(brain_wsir4_12)
+dist_pca <- dist(brain_pca4_12)
+
+print("cors:")
+
+cor(c(as.matrix(dist_sir[lower.tri(dist_sir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+cor(c(as.matrix(dist_wsir[lower.tri(dist_wsir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+cor(c(as.matrix(dist_pca[lower.tri(dist_pca)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+
+print("ARIs for powers 1:20")
+
+for (i in 1:10) {
+  weight_mat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles4, power = i)
+  brain_sir_w <- categorical_sir(X = brain_genom_wo, Y = brain_tiles4, directions = 8, W = weight_mat)
+  brain_wsir_12 <- brain_sir_w[[1]][,1:2]
+  brain_wsir_kmns <- kmeans(brain_wsir_12, centers = 3)$cluster
+  adjustedRandIndex(x = brain_tiles4[,1], y = brain_wsir_kmns) %>% print()
+}
+```
+
+UMAPs
+
+Only looking at 3x3 tiles (where it does best)
+
+```{r}
+sir_umap3 <- umap(brain_sir[[1]])
+plot(sir_umap3[,1:2], col = brain_tiles[,1])
+
+wsir_umap3 <- umap(brain_sir_w[[1]])
+plot(wsir_umap3[,1:2], col = brain_tiles[,1])
+
+pca_umap3 <- umap(pc_brain)
+plot(pca_umap3[,1:2], col = brain_tiles[,1])
+```
+
+Slicing on tile and celltype
+
+```{r}
+brain_alloc <- spatial_allocator(X = brain_genom_wo, coords = brain_coords_wo, slices = 2)
+brain_alloc[,352]
+unique(brain_alloc[,352])
+brain_celltype_wo[,1]
+
+plot(brain_coords_wo[,1:2], col = factor(brain_alloc[,352]))
+
+brain_11 <- filter(brain_alloc, brain_alloc$coordinate == "1, 1")
+brain_alloc$celltype <- brain_celltype_wo[,1]
+
+brain_alloc[,352:353]
+
+brain_alloc$coord_celltype <- paste(brain_alloc$coordinate, brain_alloc$celltype)
+  
+plot(brain_coords_wo[,1:2], col = factor(brain_alloc$coord_celltype))
+
+g10 <- (setNames(table(brain_alloc$coord_celltype), NULL)>10)
+tile_names <- names(table(brain_alloc$coord_celltype))
+
+keep_tiles <- c()
+for (i in 1:length(tile_names)) {
+  if (g10[i]) {
+    keep_tiles <- keep_tiles %>% append(tile_names[i])
+  }
+}
+keep_tiles
+
+brain_alloc_g10 <- brain_alloc %>% filter(brain_alloc$coord_celltype %in% keep_tiles)
+brain_coords_g10 <- brain_coords_wo %>% filter(brain_alloc$coord_celltype %in% keep_tiles)
+
+plot(brain_coords_g10[,1:2], col = factor(brain_alloc_g10$coord_celltype))
+plot(brain_coords_g10[,1:2], col = factor(brain_alloc_g10$coordinate))
+length(unique(brain_alloc_g10$coord_celltype))
+```
+
+
+
+```{r}
+ggplot(brain3x3_df, aes(x = -x, y = y, col = tile)) +
+  geom_point() +
+  labs(x = "X coordinate", y = "Y coordinate") +
+  ggtitle("Position and Tile Assignment") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(brain3x3_df, aes(x = sir1, y = sir2, col = tile)) +
+  geom_point() +
+  labs(x = "First SIR Direction", y = "Second SIR Direction") +
+  ggtitle("SIR 1, 2 and Tile Assignment") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(brain3x3_df, aes(x = wsir1, y = wsir2, col = tile)) +
+  geom_point() +
+  labs(x = "First wSIR Direction", y = "Second wSIR Direction") +
+  ggtitle("Weighted SIR 1, 2 and Tile Assignment") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(brain3x3_df, aes(x = pc2, y = pc3, col = tile)) +
+  geom_point() +
+  labs(x = "Second Principal Component", y = "Third Principal Component") +
+  ggtitle("PC 2, 3 and Tile Assignment") + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+brain3x3_df
+```
+
+
+
+# Notes for poster (5 sept)
+
+y1, y2 for spatial coords DONE
+
+boxes: less space between them, make the edges grey and rounded corners
+
+visualise steps of SIR
+
+flowchart instead of 1,2,3 for sIR steps
+
+change font sizes to 60 for titles, 40 for body 
+
+less words, more pictures/diagrams 
+
+Make it more enticing to come look at it.
+
+Emphasise the novelty: weighting. In both the poster and in the conversation. 
+New way to improve it. 
+
+Make it easy for me to refer to parts of the poster in conversation
+
+Maybe don't go for full sentences. 
+
+Use big subheadings: What is SIR/DR above first 3 boxes, then Weighted SIR improves SIR above the 2 boxes on weighting
+
+Don't just write results, give more information: prediction of mouse brain.
+
+make the formula and where we insert W obvious.
+
+Make a flowchart showing how we have tiles in place, then they fall into a heap when we perform SIR 
+
+Make the ggplot titles larger 
+
+Use a way in ggplot to arrange the 3 plots together, rather than placing 3 photos. Better for resolution. Patchwork package is good (see slack). facet_wrap or facet_grid
+
+ggpubr package for good plots (see slack)
+
+theme classic (not b&w) (see above plot where I used + theme_classic() )
+
+Try long format data instead of wide for the facet_wrap or facet_grid option 
+
+
+```{r}
+brain3x3_df %>% dplyr::select(-c(x, y)) %>%
+  pivot_longer(cols = sir1:pc3, names_to = "method", values_to = "value")
+
+brain3x3_df %>% dplyr::select(-c(x, y)) %>%
+  pivot_longer(cols = starts_with("sir"):starts_with("pc"), names_to = "method", values_to = "value")
+
+
+reshape::melt(brain3x3_df[,1:3])
+```
+
+```{r}
+brain3x3_df_sir  = brain3x3_df %>% 
+  select(tile, sir1, sir2) %>% 
+  rename(dir1 = sir1, dir2 = sir2) %>%
+  mutate(Method = "SIR")
+
+brain3x3_df_wsir  = brain3x3_df %>% 
+  select(tile, wsir1, wsir2) %>% 
+  rename(dir1 = wsir1, dir2 = wsir2) %>%
+  mutate(Method = "WSIR")
+
+brain3x3_df_pca  = brain3x3_df %>% 
+  select(tile, pc2, pc3) %>% 
+  rename(dir1 = pc2, dir2 = pc3) %>%
+  mutate(Method = "PCA")
+
+brain3x3_df_spat  = brain3x3_df %>% 
+  select(tile, x, y) %>% 
+  rename(dir1 = x, dir2 = y) %>%
+  mutate(Method = "Spatial")
+
+brain3x3_newdf = rbind(brain3x3_df_sir, brain3x3_df_wsir, brain3x3_df_pca, brain3x3_df_spat)
+
+plot2 <- ggplot(brain3x3_newdf, aes(x = dir1, y = dir2, col = tile)) +
+  geom_point(size = 0.8) + 
+  theme_classic() +
+  facet_wrap(vars(Method), scales = "free", nrow = 2) + 
+  theme(strip.background = element_rect(colour = NA)) + 
+  theme(strip.text = element_text(size = 10)) + 
+  labs(x = "Direction 1", y = "Direction 2") +
+  guides(colour = guide_legend(title = "Tile", override.aes = list(size = 5)))
+
+plot2
+ggsave("pca_sir_wsir_comparison.pdf", width = 12, height = 4)
+#saveRDS(brain3x3_df, file = "brain3x3_df_sir.Rds")
+
+
+```
+
+```{r}
+brain3x3_sirs <- brain3x3_newdf %>% filter(Method == "SIR" | Method == "WSIR")
+
+ggplot(brain3x3_df, aes(x = x, y = y)) +
+  geom_point(size = 0.9) +
+  theme_classic() + 
+  labs(x = "X Coordinate", y = "Y Coordinate")
+
+ggplot(brain3x3_df, aes(x = x, y = y, col = tile)) +
+  geom_point(size = 0.9) +
+  theme_classic() + 
+  labs(x = "X Coordinate", y = "Y Coordinate") +
+  guides(colour = guide_legend(title = "Tile", override.aes = list(size = 3)))
+```
+
+
+# Make dendrogram between cell types
+
+```{r}
+celltype_avgs <- slicer(X = brain_genom_wo, Y = "none", provided = TRUE, allocation = brain_celltype_wo[,1])
+rownames(celltype_avgs) <- unique(brain_celltype_wo[,1])
+celltype_avgs_sc <- celltype_avgs %>% scale() %>% as.data.frame()
+
+celltype_avgs_sc
+dist_mat <- dist(celltype_avgs_sc)
+dist_mat
+hclust_avg <- hclust(dist_mat, method = 'single')
+
+plot(hclust_avg)
+
+?hclust
+?dist
+```
+
+# 12 Sept feedback
+
+Compare methods to other ones, e.g. tSNE, UMAP (for those, maybe need other clustering methods, not kmeans), visualise and/or find ARIs.
+Instead of UMAP or tSNE on entire data, could run it on the PCs or SIRs or wSIRs (because apparently it just works better on that). Use that as a lens to compare PCA, SIR, wSIR. Answer question of how does it compare to tSNE or UMAP with they are just not appropriate because it would take too long (we want linear DR). 
+
+Maybe don't want to double dip by making weighting for categorical, which we are doing by hclusting on the distance matrix from the X. 
+
+Single cell multiomics data, e.g siteseq: measure all genes and subset of proteins
+hclust on just proteins, then use the gene expression data as our X. 
+
+Find the underlying continuous direction (e.g PC or manifold) which classes the categories, then use that as continuous Y on which to make the weighting. 
+
+For scRNAseq data, we usually don't have spatial coords, but we can make mulitivariate response by selecting multiple of the X columns and using them as the response. 
+
+For y = celltype, we would need many dimensions to explain the response. But for y = spatial coordinates, we probably only need a few dense dimensions to explain it. 
+
+Look at whole embryo, and run spatial SIR on that. We expect a few genes to be quite important for that. 
+
+Looking at cluster-interaction-tile as the slices will be interesting. For cluster: find number of clusters of the data, then use those as in previous sentence. 
+
+Could slice on time too as above, could be useful for a video. 
+
+Get everything on github. Create a github.com name, and join the sydney biox github 
+
+Write things up, get every word on a page (not at all final) by start of midsem. Then send drafts for 2 weeks after that. Make preso during midsem. 
+
+# Performing clustering on gene data
+
+Doing this for the cluster-interaction-tile slice method
+
+```{r}
+fviz_nbclust(brain_genom_wo, kmeans, method = "silhouette", k.max = 10) # find optimal k
+brain_genom_kmns3 <- kmeans(brain_genom_wo, centers = 3) # perform kmeans(3)
+
+plot(brain_coords_wo[,1:2], col = brain_tiles[,1]) # show tile allocation again
+
+brain_clusters <- brain_genom_kmns3$cluster 
+plot(brain_coords_wo[,1:2], col = brain_clusters) # show cluster allocation
+
+brain_clust_tile <- paste0(brain_tiles[,1], ", ", brain_clusters) %>% as.data.frame() # create cluster-tile-interaction name (named ctile or ct onwards)
+
+cells_weight_matrix(coords = brain_coords_wo, labels = brain_clust_tile) # make weight matrix on ctile
+
+plot(brain_coords_wo[,1:2], col = factor(brain_clust_tile[,1])) # show ctile allocation
+
+table(brain_clust_tile[,1]) # see how many cells in each ctile
+
+# want to remove ctiles with <= 10 cells
+g10_clust_tile <- (setNames(table(brain_clust_tile[,1]), NULL)>10)
+g10_clust_tile
+tile_names <- names(table(brain_clust_tile[,1]))
+
+keep_tiles <- c()
+for (i in 1:length(tile_names)) {
+  if (g10_clust_tile[i]) {
+    keep_tiles <- keep_tiles %>% append(tile_names[i])
+  }
+}
+keep_tiles
+
+brain_genom_coords_ctile <- cbind(brain_genom_wo, brain_coords_wo, brain_clust_tile) # all data together (for brain, without outliers): genom, coord, ctile
+colnames(brain_genom_coords_ctile)[354] <- "ctile" # change final column name
+keep_info_g10ct <- brain_genom_coords_ctile %>% filter(ctile %in% keep_tiles) # only with large ctiles
+brain_coords_wo_g10ct <- keep_info_g10ct %>% select(c("x", "y")) # coords for wo, g10 (from ctile)
+brain_genom_wo_g10ct <- keep_info_g10ct %>% select(c(colnames(brain_genom_coords_ctile)[1:351]))
+
+colnames(brain_clust_tile) <- c("ctile")
+brain_ctile_wo_g10ct <- brain_clust_tile %>% filter(ctile %in% keep_tiles)
+
+brain_coords_wo_g10ct
+brain_genom_wo_g10ct
+brain_ctile_wo_g10ct
+
+g10ct_wmat <- cells_weight_matrix(coords = brain_coords_wo_g10ct, labels = brain_ctile_wo_g10ct)
+g10ct_wmat
+
+plot(brain_coords_wo_g10ct[,1:2], col = factor(brain_ctile_wo_g10ct[,1])) # show ctile allocation (no ctiles with <=10 cells)
+
+length(unique(brain_ctile_wo_g10ct[,1]))
+
+# all 3 plots
+plot(brain_coords_wo[,1:2], col = brain_tiles[,1]) # show tile allocation again
+plot(brain_coords_wo[,1:2], col = brain_clusters) # show cluster allocation
+plot(brain_coords_wo_g10ct[,1:2], col = factor(brain_ctile_wo_g10ct[,1])) # show ctile allocation (no ctiles with <=10 cells)
+```
+
+## Spatial SIR using cluster-interaction-tile
+
+```{r}
+
+for (i in 1:20) {
+  wmat <- cells_weight_matrix(coords = brain_coords_wo_g10ct, 
+                                  labels = brain_ctile_wo_g10ct,
+                                  power = i)
+  sir_wo_g10_ct <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct, W = wmat)
+  plot(sir_wo_g10_ct[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+}
+
+brain_sir_wo_g10ct <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct, W = g10ct_wmat)
+plot(brain_sir_wo_g10ct[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+
+
+sir_wo_g10_ct_noweight <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct)
+plot(sir_wo_g10_ct_noweight[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+
+wmat <- cells_weight_matrix(coords = brain_coords_wo_g10ct, 
+                                  labels = brain_ctile_wo_g10ct,
+                                  power = 18)
+sir_wo_g10_ct <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct, W = wmat)
+plot(sir_wo_g10_ct[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+```
+
+# 19 September Notes
+
+Try using 2x2 tiles for ctiles instead of 3x3: maybe there are too many tiles.
+
+For distances in weight matrix: want to incorporate cluster distance as well as tile (or ctile) distance: can do this in various ways (see photo).
+Then use distance = alpha(tile distance) + (1-alpha)(cluster distance).
+Try different options for alpha, (e.g 0, 0.25, 0.5, 0.75, 1) and see what does best.
+Options for cluster distance:
+0 if same cluster, otherwise 1
+Euclidean distance between cluster centroids in X-space
+
+# Making cluster distance
+
+```{r}
+for (i in 1:length(keep_tiles)) {
+  str_split(keep_tiles[i], pattern = " ")[[1]][3] %>% as.numeric() %>% print()
+}
+keep_tiles
+num_tiles <- length(keep_tiles)
+
+cdist_mat <- matrix(rep(NA, num_tiles^2), nrow = num_tiles)
+
+for (i in 1:num_tiles) {
+  for (j in 1:num_tiles) {
+    c1 <- str_split(keep_tiles[i], pattern = " ")[[1]][3] %>% as.numeric()
+    c2 <- str_split(keep_tiles[j], pattern = " ")[[1]][3] %>% as.numeric()
+    dist <- br_clust_dim_df[c1,c2]
+    cdist_mat[i,j] <- dist
+  }
+}
+cdist_mat
+
+br_clust_dim <- brain_genom_kmns3$centers %>% dist()
+br_clust_dim
+
+dists_for_df <- c(0, br_clust_dim[1], br_clust_dim[2], br_clust_dim[1], 0, br_clust_dim[3], br_clust_dim[2], br_clust_dim[3], 0)
+br_clust_dim_df <- matrix(dists_for_df, nrow = 3) %>% as.data.frame()
+colnames(br_clust_dim_df) <- c("1", "2", "3")
+br_clust_dim_df
+```
+
+# Making ctile weighting using cluster distance and tile distance
+
+```{r}
+wmat1 <- cells_weight_matrix(coords = brain_coords_wo_g10ct, 
+                                  labels = brain_ctile_wo_g10ct,
+                                  power = 1)
+tile_distance <- wmat1 %>% as.matrix()
+
+cluster_distance <- cdist_mat %>% as.matrix()
+
+alphas <- c(0:10)/10
+alphas
+
+tcdist_alpha_wmat <- tile_distance * alpha  + cluster_distance  * (1-alpha)
+
+tcdist_alpha_sir <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct, W = tcdist_alpha_wmat)
+plot(tcdist_alpha_sir[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+
+# first is only cluster distance, last is only tile distance
+for (alpha in alphas) {
+  tcdist_alpha_wmat <- tile_distance * alpha  + cluster_distance  * (1-alpha)
+
+  tcdist_alpha_sir <- categorical_sir(X = brain_genom_wo_g10ct, Y = brain_ctile_wo_g10ct, W = tcdist_alpha_wmat)
+  plot(tcdist_alpha_sir[[1]][,1:2], col = factor(brain_ctile_wo_g10ct[,1]))
+}
+```
+
+# 26 September notes
+
+For quantitative view of how well it performs: 
+1) k-fold CV, performing all tasks on each fold.
+2) scatterplot, axes are distances between pairs in reality and in lower dimensional spaces. 
+
+# 28 September Notes (Team Shila Preso)
+
+See if wSIR drops in quality with too many slices as fast as SIR does
+
+Map spatial positon from one embryo to another using wSIR. Project data from one embryo using directions from original embryo 
+
+
+
+
+# CV to compare performance of all DR methods
+
+Data to use: 
+brain_coords_wo_g10ct
+brain_genom_wo_g10ct
+
+create:
+brain_ctile_wo_g10ct
+
+Methods: 
+- standard spatial SIR
+- wSIR with weights on tile
+- wSIR with weights on ctile
+- PCA
+
+```{r}
+start <- Sys.time()
+
+cvK = 5  # number of CV folds
+cv_acc5_rtimes_train = cv_acc5_train = c()
+cv_acc5_rtimes_test = cv_acc5_test = c()
+r = 4
+n = nrow(brain_genom_wo_g10ct)
+
+for (i in 1:r) {
+  if (i %% 10 == 0) {
+    print(i)
+  }
+  cvSets = cvTools::cvFolds(n, cvK)  # permute all the data, into 5 folds
+
+  cv_acc5_test = NA  # initialise results vector
+  cv_acc5_train = NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_test = brain_genom_wo_g10ct[test_id, ]
+    X_train = brain_genom_wo_g10ct[-test_id, ]
+    y_test = brain_tiles[test_id,]
+    y_train = brain_tiles[-test_id,]
+    
+    Z_sir <- categorical_sir(X = X_train, Y = as.data.frame(y_train), directions = 23)
+    Z_train <- Z_sir[[1]]
+    Z_test <- as.matrix(X_test) %*% Z_sir[[2]]
+    
+    #fit5 = class::knn(train = Z_train, test = Z_test, cl = y_train, k = 7)
+    fit5 = svm(Z_train, factor(y_train))
+    predicted_test <- predict(fit5, newdata = Z_test)
+    predicted_train <- predict(fit5, newdata = Z_train)
+    
+    cv_acc5_test[j] = table(predicted_test, y_test) %>% diag %>% sum %>% `/`(length(y_test))
+    cv_acc5_train[j] = table(predicted_train, y_train) %>% diag %>% sum %>% `/`(length(y_train))
+  }
+  cv_acc5_rtimes_test <- append(cv_acc5_rtimes_test, mean(cv_acc5_test))
+  cv_acc5_rtimes_train <- append(cv_acc5_rtimes_train, mean(cv_acc5_train))
+}
+test_mean_tile <- cv_acc5_rtimes_test %>% mean()
+train_mean_tile <- cv_acc5_rtimes_train %>% mean()
+
+end <- Sys.time()
+time_taken <- end - start
+time_taken
+
+train_mean_tile
+test_mean_tile
+```
+
+
+```{r}
+brain_genom %>% dim()
+```
+
+# 3 Oct notes
+
+see ARIs for the ctile weighting, compare to ARIs from before
+try 3D plots 
+distance correlation and scatterplot
+
+energy package
+
+distance correlations is maybe better because it doesn't rely on kmeans
+
+Include TOC for thesis 
+
+bibtex for references 
+
+prioritise filling out structure and TOC first for thesis, over doing more writing.
+Send over powerpoint preso when done.
+
+
+
+# preso vizs
+
+```{r}
+library(gt)
+
+preso_wmat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles) %>% round(2) %>% as.data.frame()
+
+rownames(preso_wmat) <- unique(brain_tiles[,1]) %>% levels()
+colnames(preso_wmat) <- unique(brain_tiles[,1]) %>% levels()
+preso_wmat
+
+# Example Weight Matrix
+preso_wmat$rownames <- rownames(preso_wmat)
+gt(preso_wmat, rowname_col = "rownames", rownames_to_stub = FALSE) %>%
+  tab_header(title = md("**Example Weight Matrix**"))
+
+# Empty Weight Matrix
+preso_wmat_empty <- matrix(rep("?", 81), nrow = 9) %>% as.data.frame()
+preso_wmat_empty$rownames <- rownames(preso_wmat)
+colnames(preso_wmat_empty) <- colnames(preso_wmat)
+diag(preso_wmat_empty) <- 1
+gt(preso_wmat_empty, rowname_col = "rownames", rownames_to_stub = FALSE) %>%
+  tab_header(title = md("**Possible Weight Matrix**"))
+
+ggplot(brain3x3_df, aes(x = x, y = y, col = tile)) +
+  geom_point(size = 0.9) +
+  theme_classic() + 
+  guides(colour = guide_legend(title = "Tile", override.aes = list(size = 3))) +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate"))
+
+dim(brain_genom_wo)
+```
+
+
+Finding optimal power for weight matrix for brain_..._wo
+```{r}
+nalpha <- 15
+
+brain_alpha_ari_cor <- matrix(rep(NA, nalpha*3), nrow = nalpha, ncol = 3) %>% as.data.frame()
+colnames(brain_alpha_ari_cor) <- c("alpha", "ari", "cor")
+brain_alpha_ari_cor$alpha <- c(1:nalpha)
+
+for (i in 1:nalpha) {
+  weight_mat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles, power = i)
+  brain_sir_w <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 8, W = weight_mat)
+  brain_wsir_12 <- brain_sir_w[[1]][,1:2]
+  brain_wsir_kmns <- kmeans(brain_wsir_12, centers = 3)$cluster
+  ari = adjustedRandIndex(x = brain_tiles[,1], y = brain_wsir_kmns)
+  dist_wsir <- dist(brain_wsir_12)
+  cor = cor(c(as.matrix(dist_wsir[lower.tri(dist_wsir)])),
+     c(as.matrix(spatial_dist[lower.tri(spatial_dist)])), method = "spearman",
+    use = "pair")
+  print(i)
+  brain_alpha_ari_cor[i,2] <- ari
+  brain_alpha_ari_cor[i,3] <- cor
+}
+
+ggplot(brain_alpha_ari_cor, aes(x = alpha, y = ari)) + 
+  geom_line(color = "#31394d") +
+  theme_classic() + 
+  labs(x = expression(alpha), y = "ARI") +
+  ggtitle(bquote("ARI between clusters and tiles against \u03b1")) +
+  geom_vline(xintercept = 6, linetype = "dotted", color = "green4") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+brain_alpha_ari_cor
+```
+
+
+```{r}
+brain_coords_wo %>% head()
+tail(brain_coords_wo)
+colnames(brain_genom_wo)[351]
+plot(brain_coords_wo[,1:2])
+
+# plotting brain image
+ggplot(brain_coords_wo, aes(x = x, y = y)) + 
+  geom_point(size = 0.8, color = "#31394d") +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Mouse Embryo Brain Spatial Coordinates") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+br_coord_celltype <- cbind(brain_coords_wo, brain_celltype_wo)
+colnames(br_coord_celltype) <- c("x", "y", "celltype")
+
+br_coord_celltype <- br_coord_celltype %>% mutate(Region = case_when(
+  celltype == "Tegmentum" | celltype == "Mesencephalon" ~ "Midbrain",
+  celltype == "Prosencephalon 1" | celltype == "Prosencephalon 2" ~ "Forebrain",
+  celltype == "Rhombencephalon 1" | celltype == "Rhombencephalon 2" | celltype == "Rhombencephalon 3" ~ "Hindbrain",
+))
+#br_coord_celltype$Region <- as.factor(br_coord_celltype$area)
+
+ggplot(br_coord_celltype, aes(x = x, y = y, color = Region)) + 
+  geom_point(size = 0.8) +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates with Brain Region") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot(prcomp(brain_genom_wo)$x[,1:2], col = br_coord_celltype$area)
+brain_genom_wo
+?prcomp
+
+plot(brain3x3_df_wsir[,2:3], col = br_coord_celltype$area)
+plot(brain3x3_df_sir[,2:3], col = br_coord_celltype$area)
+plot(prcomp(brain_genom_wo)$x[,1:2], col = br_coord_celltype$area)
+```
+
+1D slicing demo
+
+```{r}
+slicing_example <- rnorm(50) %>% as.data.frame()
+colnames(slicing_example) <- c("value")
+slicing_example <- slicing_example %>% arrange(value)
+slicing_example$Slice <- as.factor(c(rep(1,10), rep(2, 10), rep(3,10), rep(4,10), rep(5,10)))
+ggplot(slicing_example, aes(x = value, fill = Slice)) + 
+  geom_dotplot(binwidth = 0.2, dotsize = 0.5, stackdir = "center") +
+  labs(x = "Y Value", y = "Density") +
+  ggtitle("Slice Allocation for Univariate Continuous Response Y") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+```
+
+```{r}
+pc_brain
+?prcomp
+run_pca <- prcomp(brain_genom_wo)
+a <- summary(run_pca)
+proportion_variance <- run_pca$sdev^2/sum(run_pca$sdev^2)
+cum_proportion_variance <- cumsum(proportion_variance)
+
+pca_160kmns <- run_pca$x[,1:160] %>% kmeans(centers = 3)
+
+plot(brain_coords_wo[,1:2], col = as.factor(pca_160kmns$cluster))
+
+plot(brain_coords_wo[,1:2], col = as.factor(brain_wsir_kmns))
+plot(brain_coords_wo[,1:2], col = as.factor(brain_sir_kmns))
+
+# more directions for (w)SIR
+brain_sir_18 <- brain_sir[[1]][,1:2]
+brain_wsir_18 <- brain_sir_w[[1]][,1:2]
+brain_sir_kmns8 <- kmeans(brain_sir_18, centers = 3)$cluster
+brain_wsir_kmns8 <- kmeans(brain_wsir_18, centers = 3)$cluster
+plot(brain_coords_wo[,1:2], col = as.factor(brain_wsir_kmns8))
+plot(brain_coords_wo[,1:2], col = as.factor(brain_sir_kmns8))
+
+# ARIs on above
+ari_sir <- adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns8)
+ari_wsir <- adjustedRandIndex(x = brain_tiles[,1], y = brain_wsir_kmns8)
+ari_pca <- adjustedRandIndex(x = brain_tiles[,1], y = pca_160kmns$cluster)
+c(ari_sir, ari_wsir, ari_pca)
+```
+
+
+# Maximising d and then alpha
+
+```{r}
+#dim(brain_sir[[2]])
+
+brain_sir_12 <- brain_sir[[1]][,1:2]
+brain_sir_14 <- brain_sir[[1]][,1:4]
+brain_sir_kmns2 <- kmeans(brain_sir_12, centers = 3)$cluster
+brain_sir_kmns4 <- kmeans(brain_sir_14, centers = 3)$cluster
+ari_sir2 <- adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns2)
+ari_sir4 <- adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns4)
+c(ari_sir2, ari_sir4)
+
+ari_is <- c()
+for (i in 2:8) {
+  brain_sir_i <- brain_sir[[1]][,1:i]
+  brain_sir_kmns_i <- kmeans(brain_sir_i, centers = 3)$cluster
+  ari_sir_i <- adjustedRandIndex(x = brain_tiles[,1], y = brain_sir_kmns_i)
+  ari_is <- ari_is %>% append(ari_sir_i)
+}
+ari_d_df <- matrix(NA, nrow = 7, ncol = 2) %>% as.data.frame()
+colnames(ari_d_df) <- c("directions", "ari")
+ari_d_df$directions <- c(2:8)
+ari_d_df$ari <- ari_is
+
+ggplot(ari_d_df, aes(x = directions, y = ari)) +
+  geom_point(col = "#31394d") +
+  geom_line(col = "#31394d") +
+  labs(x = "Directions", y = "ARI") +
+  ggtitle("ARI Between Tiles and Clusters") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# alpha = 6, d = 2 found to be best
+
+weight_mat <- cells_weight_matrix(coords = brain_coords_wo, labels = brain_tiles, power = 6)
+
+brain_sir_w <- categorical_sir(X = brain_genom_wo, Y = brain_tiles, directions = 2, W = weight_mat)
+brain_wsir_rotation <- brain_sir_w[[2]]
+```
+
+
+```{r}
+br_coords2 %>% dim()
+```
+
+
+# Sample 2 Study
+
+```{r}
+# Load in data from sample 2 (downloading it is in downloading.rmd)
+
+exprs2 <- readRDS("seqFISH_exprs2.Rds")
+coords2 <- readRDS("seqFISH_coords2.Rds")
+meta2 <- readRDS("seqFish_meta2.Rds")
+
+# process data for just brain
+
+indices <- meta2$celltype == "Forebrain/Midbrain/Hindbrain" & 
+  as.data.frame(coords2)$x < 1 & 
+  as.data.frame(coords2)$y < 0
+br_exprs2 <- exprs2[indices,]
+br_coords2 <- coords2[indices,]
+
+# plot spatial coords, coloured by cluster allocation computeted on low-dim representations
+
+br2_wsir <- br_exprs2 %*% brain_wsir_rotation %>% as.matrix()
+br2_wsir_kmns <- kmeans(br2_wsir, centers = 3)$cluster
+plot(as.data.frame(br_coords2)[,1:2], col = factor(br2_wsir_kmns))
+
+br2_sir <- br_exprs2 %*% brain_sir[[2]][,1:2] %>% as.matrix()
+br2_sir_kmns <- kmeans(br2_sir, centers = 3)$cluster
+plot(as.data.frame(br_coords2)[,1:2], col = factor(br2_sir_kmns))
+
+pc_rotation <- prcomp(brain_genom_wo)$rotation
+br2_pca <- br_exprs2 %*% pc_rotation[,1:50] %>% as.matrix()
+br2_pca_kmns <- kmeans(br2_pca, centers = 3)$cluster
+plot(as.data.frame(br_coords2)[,1:2], col = factor(br2_pca_kmns))
+
+# Find tiles for ARI
+
+brain_allocation2 <- spatial_allocator(X = as.data.frame(as.matrix(br_exprs2)), 
+                                       coords = as.data.frame(as.matrix(br_coords2)), 
+                                       slices = 3)
+
+brain_tiles2 <- factor(brain_allocation2$coordinate) %>% as.data.frame()
+
+# Compute ARIs
+
+ari2_wsir <- adjustedRandIndex(x = brain_tiles2[,1], y = br2_wsir_kmns)
+ari2_sir <- adjustedRandIndex(x = brain_tiles2[,1], y = br2_sir_kmns)
+ari2_pca <- adjustedRandIndex(x = brain_tiles2[,1], y = br2_pca_kmns)
+
+c(ari2_wsir, ari2_sir, ari2_pca)
+
+# Make the cluster allocation plots look good
+
+br2_clusters_df <- matrix(NA, nrow = nrow(br_coords2), ncol = 5) %>% as.data.frame()
+colnames(br2_clusters_df) <- c("x", "y", "WSIR", "SIR", "PCA")
+br2_clusters_df[,1] <- br_coords2[,1]
+br2_clusters_df[,2] <- br_coords2[,2]
+br2_clusters_df[,3] <- factor(br2_wsir_kmns)
+br2_clusters_df[,4] <- factor(br2_sir_kmns)
+br2_clusters_df[,5] <- factor(br2_pca_kmns)
+br2_clusters_df$Tile <- brain_tiles2[,1]
+
+# Embryo 2 coordinates coloured by clustering on DR algorithm
+ggplot(br2_clusters_df, aes(x = x, y = y, color = SIR)) + 
+  geom_point(size = 0.8) +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 2 Spatial Coordinates Coloured by SIR Cluster") +
+  labs(color = "Cluster allocation") +
+  theme(plot.title = element_text(hjust = 0.5))
+ggplot(br2_clusters_df, aes(x = x, y = y, color = WSIR)) + 
+  geom_point(size = 0.8) +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 2 Spatial Coordinates Coloured by WSIR Cluster") +
+  labs(color = "Cluster allocation") +
+  theme(plot.title = element_text(hjust = 0.5))
+ggplot(br2_clusters_df, aes(x = x, y = y, color = PCA)) + 
+  geom_point(size = 0.8) +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 2 Spatial Coordinates Coloured by PCA Cluster") +
+  labs(color = "Cluster allocation") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Embryo 2 Tile Allocation
+ggplot(br2_clusters_df, aes(x = x, y = y, color = Tile)) +
+  geom_point(size = 0.8) +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 2 Spatial Coordinates Coloured by Tile") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Embryo 2 Coordinates
+ggplot(br2_clusters_df, aes(x = x, y = y)) +
+  geom_point(size = 0.8, color = "#31394d") +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 2 Spatial Coordinates") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Embryo 1 Coordinates (whole embryo)
+ggplot(genom_coords, aes(x = x, y = y)) +
+  geom_point(size = 0.4, color = "#31394d") +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Embryo 1 Coordinates
+ggplot(br_coord_celltype, aes(x = x, y = y)) + 
+  geom_point(size = 0.8, color = "#31394d") +
+  theme_classic() +
+  xlab(bquote(~Y[1]~" Coordinate")) +
+  ylab(bquote(~Y[2]~" Coordinate")) +
+  ggtitle("Embryo 1 Spatial Coordinates") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ARI barplot
+
+ari_df2 <- matrix(NA, nrow = 3, ncol = 2) %>% as.data.frame()
+colnames(ari_df2) <- c("Method", "ARI")
+ari_df2$Method <- c("SIR", "WSIR", "PCA")
+ari_df2$ARI <- c(ari2_sir, ari2_wsir, ari2_pca)
+ari_df2
+
+ggplot(ari_df2, aes(x = Method, y = ARI)) + 
+  geom_bar(stat="identity", fill = "#ede3da", width = 0.3, color = "#31394d") +
+  ggtitle("ARI between clusters and (true) tiles per method") +
+  geom_text(aes(label = round(ARI, 3)), vjust=-0.3, size=3.5) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 12, color = "#31394d"),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        axis.text.x = element_text(size = 12, color = "#31394d"))
+```
+
+
+```{r}
+# Getting only brain, no outliers coords and exprs
+
+indices <- meta2$celltype == "Forebrain/Midbrain/Hindbrain" & 
+  as.data.frame(coords2)$x < 1 & 
+  as.data.frame(coords2)$y < 0
+br_exprs2 <- exprs2[indices,]
+br_coords2 <- coords2[indices,]
+
+dim(br_coords2)
+```
+
+# 17 oct notes
+
+Use discussion fo rthe next things to explore, don't do them
+
+# 24 Oct Notes
+
+in intro: longer, give more background, motivation, explain more about high-dim data before the structure. Go into some detail here, then more detail in chapter 2. Explain more of what goes into each chapter, include diagram of how each chapterr follows and what goes into each in a schematic.
+
+For motivation: include what is already out there, what is the current literature landscape: what it deals with.
+
+In intro, grab lots of references from other papers on SIR. 
+
+Structure: combine univariate into one chapter, containing continuous and categorical. Next chapter: spatial. Next chapter: Novel weighting. 
+
+PCA vs SIR sine plot: rescale the directions so the axes are the same. 
+
+Include overall schematic: what does the project do, what is covered in each chapter, in table form is good (one row per chapter)
+
+In appendix: include any extra things, but do refer to them in the body. 
+
+get to 70/80 pages for now, fill out with figures and everything. 
+Word vomit everything, especially the spatial section, discussion and conclusion
+
+Get it into the template to make it look more real. 
+
+Section 2.3: explore the data a little bit, not just saying what it is. Find correlations, explore easy DR. Why is it high-dimensional, what is response, etc, what are the proportions. 
+
+Should be understandable to layperson, get other people to read it and say what they don't understand. Explain everything, even what is a gene. 
+
+Get 70 pages by Friday: this means 18 each day up to then. 
+
+```{r}
+univ_df <- matrix(NA, nrow = 3, ncol = 6) %>% as.data.frame()
+colnames(univ_df) <- c("Name", "Latitude", "Longitude", "World_Ranking", "Number_of_Students", "Students_per_Staff")
+univ_df$Name <- c("Stanford University", "Oxford University", "Harvard University")
+univ_df$Latitude <- c(37.4, 51.6, 42.4)
+univ_df$Longitude <- c(-122.2, -1.3, -71.1)
+univ_df$World_Ranking <- c(3,1,2)
+univ_df$Number_of_Students <- c(16164, 20965, 21887)
+univ_df$Students_per_Staff <- c(7.1, 10.6, 9.6)
+
+univ_df %>% 
+  gt() %>% 
+  tab_header("Universities Dataframe with Spatial Responsee") %>%
+  tab_spanner(label = "Y", columns = c(Latitude, Longitude)) %>%
+  tab_spanner(label = "X", columns = c(World_Ranking, Number_of_Students, Students_per_Staff))# %>% 
+  #tab_spanner(label = "Name", columns = c(Name))
+``` 
+
+
+
+
+
+
+
+
+
+
+
+
+
