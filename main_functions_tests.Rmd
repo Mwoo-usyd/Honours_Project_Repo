@@ -1,0 +1,563 @@
+---
+title: "Week 2 Functions (basis of R files)"
+author: '500455892'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(mvtnorm)
+library(dr)
+set.seed(2023)
+source("sir_functions.R")
+```
+
+# (Week 2) SIR Functions
+
+## Sorter
+
+```{r}
+sir_sorter_w2 <- function(dataset, y = colnames(dataset)[1]) {
+  
+  # This function sorts the dataset by the target variable
+  
+  # dataset is a dataframe
+  # y is a character, that is the name of the column that is y (that you want to sort by)
+  
+  dataset_new <- dataset %>% arrange(get(y)) # arrange by values of y
+  
+  return(dataset_new) # return the dataset that is now sorted by values of y
+}
+```
+
+## Divider
+
+This takes a dataframe (that includes y) and a name for the column of y
+
+```{r}
+divider_w2 <- function(dataset, slices = 8, categorical = FALSE, y, ordinal = FALSE) {
+  
+  #### IMPORTANT: if y is categorical, must give arguments for dataset and y
+  
+  # Function to assign a slice number to each row of the dataset
+  
+  # Arguments: rows is an integer, should equal nrow(dataset);
+  # slices is an integer, is the number of slices desired by user. Default is 8.
+  # categorical is a boolean, value of TRUE set by user if y (from dataset) is a categorical variable, otherwise FALSE. If TRUE, then number of slices = number of unique categories. 
+  
+  # Method: create a vector whose length = rows, and assign a slice number to each element corresponding to which slice each row should belong to.
+  
+  rows <- nrow(dataset)
+  
+  if (!categorical) {
+    rem <- rows%%slices # explain slices and set default 
+    sizes <- rep(0, slices) # explain 
+    for (i in 1:slices) {
+      if (i <= rem) {
+        sizes[i] <- rows%/%slices + 1
+      } else {
+        sizes[i] <- rows%/%slices
+      }
+    }
+  } else {
+    cols <- colnames(dataset)
+    y_pos <- match(y, cols)
+    values <- dataset[,y_pos]
+    slices <- length(unique(values))
+    sizes <- rep(0, slices)
+    for(i in 1:slices) {
+      sizes[i] <- table(values)[[i]]
+    }
+  }
+  allocation <- c()
+  for (i in 1:slices) {
+    allocation <- allocation %>% append(rep(i, sizes[i]))
+  }
+  return(allocation)
+}
+```
+
+## Means (used for the slicing)
+
+```{r}
+means <- function(dataset_one_slice) {
+  nc <- ncol(dataset_one_slice)
+  vals <- c()
+  means_array <- colMeans(dataset_one_slice)
+  for (i in 1:nc) {
+    vals <- vals %>% append(means_array[[i]])
+  }
+  return (vals)
+}
+
+```
+
+## Slicer
+
+```{r}
+sir_slicer_w2 <- function(dataset, categorical = FALSE, slices = 8, y, ordinal = FALSE) {
+  dataset <- dataset %>% arrange(get(y))
+  
+  cols <- colnames(dataset)
+  y_pos <- match(y, cols) # find index of column y
+  
+  if (categorical) {
+    slices <- length(unique(dataset[,y_pos])) 
+  }
+  
+  allocation <- divider_w2(dataset = dataset, slices = slices, categorical = categorical, y = y)
+  dataset$slice <- allocation # add column to dataset giving which slice each observation goes to
+  
+  long_values_sliced_dataframe <- c()
+  
+  for (s in 1:slices) { 
+    # find first row for current slice
+    for (i in 1:nrow(dataset)) {
+      if (dataset$slice[i] == s) {
+        first_row <- i
+        break
+      }
+    }
+    # find last row for current slice
+    for (i in 1:nrow(dataset)) {
+      if (dataset$slice[i] == s) {
+        last_row <- i
+      }
+    }
+    # find average for all columns for the particular slice
+    dataset_for_avging <- dataset[first_row:last_row, -ncol(dataset)][,-y_pos]
+    avgs <- means(dataset_for_avging) # colMeans does same thing
+    long_values_sliced_dataframe <- long_values_sliced_dataframe %>% append(avgs)
+  }
+  sliced_dataset <- matrix(long_values_sliced_dataframe, ncol = ncol(dataset)-2, byrow = TRUE) %>% as.data.frame()
+  colnames(sliced_dataset) <- colnames(dataset)[-ncol(dataset)][-y_pos]
+  rownames(sliced_dataset) <- c(1:slices)
+  return(sliced_dataset)
+}
+```
+
+## PCA
+
+```{r}
+sir_PCA <- function(dataset, directions) {
+  all_pc <- prcomp(dataset)$rotation
+  d <- min(ncol(all_pc), directions)
+  return(all_pc[,1:d])
+}
+```
+
+## Multiplier
+
+```{r}
+multiplier <- function(dataset, pc_dirs) {
+  cov_mat <- cov(dataset)
+  multiplied <- solve(cov_mat, pc_dirs)
+  return(multiplied)
+}
+```
+
+## Entire Function
+
+```{r}
+sir_all <- function(dataset, y = colnames(dataset)[1], slices = 8, directions = 10, categorical = FALSE) {
+  
+  sliced_dataset <- sir_slicer_w2(dataset = dataset, y = y, categorical = categorical, slices = slices)
+  
+  cols <- colnames(dataset)
+  y_pos <- match(y, cols)
+  
+  pc_dirs <- sir_PCA(sliced_dataset, directions = directions)
+  
+  multiplied <- multiplier(data = dataset[,-y_pos], pc_dirs = pc_dirs)
+  
+  final <- as.matrix(dataset[,-y_pos]) %*% multiplied
+  
+  return(list(final, multiplied))
+}
+```
+
+# Data Generation Functions
+
+## Generator for X
+
+```{r}
+x_gen <- function(n, p) { # make sure it follows positive definite through mat %*% t(mat)
+  m <- matrix(rnorm(p^2, 0, 5), ncol = p)
+  sigmaX <- m %*% t(m)
+  df <- rmvnorm(n, mean = rep(0, p), sigma = sigmaX) %>% as.data.frame()
+  colnames(df) <- var_names(p)
+  return(df)
+}
+```
+
+## Generator for Y
+
+```{r}
+true_B <- c(1,0,0,3,1)/50
+y_gen <- function(dataset, true_b = true_B) {
+  nc <- ncol(dataset)
+  nr <- nrow(dataset)
+  y_vals <- rep(0, nr)
+  
+  y_vals <- sin(as.matrix(dataset) %*% true_b) + 0.01*rnorm(nr)
+  
+  dataset$y_vals <- y_vals
+  return(dataset)
+}
+
+# comparable methods when max var y corred with var x 
+
+# Compare ordinal with categorical (that has no order) - see how different in algorithm
+
+# which ordinal categories to combine if need to combine some 
+```
+
+# Spatial .R file functions 
+
+```{r}
+x_sorter <- function(X, coords) {
+  x <- coords[,1]
+  X$x <- x
+  X_sorted <- X %>% arrange(x)
+  X <- X_sorted[,-ncol(X_sorted)]
+  return(X)
+}
+
+y_sorter <- function(X, coords) {
+  y <- coords[,2]
+  X$y <- y
+  X_sorted <- X %>% arrange(y)
+  X <- X_sorted[,-ncol(X_sorted)]
+  return(X)
+}
+
+spatial_allocator <- function(X, coords, slices = 8) {
+  X <- x_sorter(X, coords)
+  x_allocation <- allocator(X = X, slices = slices)
+  X$x_slice <- x_allocation
+  
+  X <- y_sorter(X, coords)
+  y_allocation <- allocator(X = X, slices = slices)
+  X$y_slice <- y_allocation
+  
+  X$coordinate <- paste0(X$x_slice, ", ", X$y_slice)
+  
+  X <- X[,-c((ncol(X)-2),(ncol(X)-1))]
+  return(X)
+}
+
+spatial_slicer <- function(X, coords, slices = 8) {
+  X_allocated <- spatial_allocator(X = X, coords = coords, slices = slices)
+  X_slice_sorted <- arrange(X_allocated, coordinate)
+  slice_names <- unique(X_allocated$coordinate)
+  long_avgs <- c()
+  for (i in slice_names) {
+    for (j in 1:nrow(X)) {
+      if (X_slice_sorted$coordinate[j] == i) {
+        first_row = j
+        break
+      }
+    }
+    for (j in 1:nrow(X)) {
+      if (X_slice_sorted$coordinate[j] == i) {
+        last_row = j
+      }
+    }
+    dataset_for_avging <- X_slice_sorted[first_row:last_row,-ncol(X_slice_sorted)]
+    avgs <- setNames(colMeans(dataset_for_avging), NULL) # colMeans does same thing
+    long_avgs <- long_avgs %>% append(avgs)
+  }
+  sliced_dataset <- matrix(long_avgs, ncol = ncol(X), nrow = length(slice_names), byrow = TRUE) %>% as.data.frame()
+  #rownames(sliced_dataset) <- c(1:slices)
+  return(sliced_dataset)
+}
+
+spatial_sir <- function(X, coords, slices = 8, directions = 10, W = diag(slices^2)) {
+  sliced_data <- spatial_slicer(X = X, coords = coords, slices = slices)
+  pc_dirs <- sir_PCA(sliced_data, directions = directions, W = W)
+  multiplied <- multiplier(data = X, pc_dirs = pc_dirs)
+  final_XB <- as.matrix(X) %*% multiplied
+  return(list(final_XB, multiplied))
+}
+```
+
+# Testing
+
+Testing with simple dataframes to check that the functions work and see basic concepts.
+
+# Testing Spatial
+
+```{r}
+X_test <- x_gen(100, 5)
+coords_test <- matrix(NA, nrow = 100, ncol = 2) %>% as.data.frame()
+colnames(coords_test) <- c("x", "y")
+coords_test$x <- sin(X_test$var1 + 3*X_test$var2 - 4*X_test$var4)
+coords_test$y <- sin(X_test$var2 + 3*X_test$var3 - 4*X_test$var5)
+rownames(X_test) <- c(1:100)
+```
+
+
+```{r}
+sliced_spatial <- spatial_slicer(X = X_test, coords = coords_test, slices = 5)
+
+sir_spatial <- spatial_sir(X = X_test, coords = coords_test, slices = 5, directions = 8)
+```
+
+## Var name function
+
+Useful for making simple dataframes for testing.
+
+```{r}
+var_names <- function(nc) {
+  vars <- c()
+  for (i in 1:nc) {
+    vars <- vars %>% append(paste0("var", i))
+  }
+  return(vars)
+}
+```
+
+## dataframe_test
+
+```{r}
+dataframe_test <- as.data.frame(matrix(rnorm(20, 0, 5), nrow = 4))
+nc <- ncol(dataframe_test)
+vars <- c()
+for(i in 1:nc) {
+  vars <- vars %>% append(paste0("var", i))
+}
+colnames(dataframe_test) <- var_names(5)
+```
+
+## categorical_df
+
+```{r}
+categorical_df <- x_gen(6,5) %>% as.data.frame()
+categorical_df <- categorical_df %>% cbind(c("apple", "apple", "orange", "orange", "apple", "orange"))
+colnames(categorical_df) <- var_names(6)
+
+sir_all(categorical_df, slices = 2, directions = 2, y = "var6")
+```
+
+# Case study: comparing SIR with PCA with trigonometric functions
+
+Below are three functions with which we generate Y from a randomly generated X (following positive definite and other requirements). 
+
+For all of the functions, I plotted the true Y values against the first dimension reduction direction. It does well if the relationship between the x and y axes on the plots is the same as the given function for the section (e.g if there appears to be a sine wave rather than random noise).
+
+## Compare Y = sin(X)
+
+```{r}
+test_data <- x_gen(200, 5)
+test_data <- test_data %>% y_gen(true_b <- c(1,0,0,3,1)/30)
+colnames(test_data)[6] <- c("y_vals")
+
+#head(sir_all(test_data, y = "y_vals", directions = 3, slices = 10)) # can run this to check it works 
+
+sin_sir <- univariate_sir(X = test_data[,-6], Y = as.data.frame(test_data[,6]), slices = 10, directions = 3)[[1]]
+
+length(sin_sir[,1])
+length(test_data$y_vals)
+length(pr[,1])
+
+sin_df <- matrix(NA, nrow = 200, ncol = 3) %>% as.data.frame()
+colnames(sin_df) <- c("y", "pca", "sir")
+sin_df$y <- test_data$y_vals
+sin_df$sir <- sin_sir[,1]
+sin_df$pca <- pr[,1]
+
+ggplot(sin_df, aes(x = sir, y = y)) + 
+  geom_point(col = "#e64626") +
+  labs(x = "First SIR Direction", y = "True Y Values") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 17),
+        axis.title.y = element_text(size = 17),
+        axis.title.x = element_text(size = 17))
+  
+ggplot(sin_df, aes(x = pca, y = y)) + 
+  geom_point(col = "#e64626") +
+  labs(x = "First Principal Component", y = "True Y Values") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 17),
+        axis.title.y = element_text(size = 17),
+        axis.title.x = element_text(size = 17))
+
+plot(sin_sir[,1], test_data$y_vals, main = "Y and first SIR direction", ylab = "True Y values", xlab = "X projected along first SIR direction") # plot 1: sine wave 
+
+pr <- prcomp(test_data[,-6])$x
+
+plot(pr[,1], test_data$y_vals, main = "Y and first PC", xlab = "First Principal Component", ylab = "True Y values") # plot 2. Compare to plot 1, does not look like the pr[,1] vector captures the information of X well at all. If it did, this would look like a sine wave.
+
+dataframe_check <- matrix(c(scale(multipd2[,1]), scale(xb[,1]), test_data$y_vals), ncol = 3, byrow = FALSE) %>% as.data.frame()
+colnames(dataframe_check) <- c("mine", "package", "y_vals")
+
+ggplot(dataframe_check) +
+  geom_point(data = dataframe_check, aes(x = mine, y = y_vals, color = "red")) +
+  geom_point(data = dataframe_check, aes(x = package, y = y_vals, color = "blue"))
+scaled_dr_obj <- multipd3$evectors[,1] %>% setNames(NULL) %>% scale()
+#scaled_dr_obj[1:5] %>% plot()
+scaled_my_obj <- sir_all_obj[2][[1]][,1] %>% setNames(NULL) %>% scale()
+scaled_my_obj[1:5] %>% plot(col = "red")
+points(scaled_dr_obj[1:5], col = "blue")
+```
+
+Why is a sine wave above good? If we could theoretically perfectly reduce the dimension of X (n * p matrix) to a n * 1 vector named x, we would get a sine wave since Y = sin(x). What we have done is use SIR to reduce X to a n * 1 vector that is PC1, and by plotting PC1 against Y we have produced a graph that looks a lot like Y = sin(PC1). Therefore, it looks like the dimension reduction technique performed well. 
+
+```{r}
+cor(true_score, multipd[,1])
+cor(true_score, pr[,1])
+```
+
+## Y = cos(X)
+
+```{r}
+set.seed(2023)
+y_gen_cos <- function(dataset) {
+  nc <- ncol(dataset)
+  nr <- nrow(dataset)
+  y_vals <- rep(0, nr)
+  for (i in 1:nr) {
+    y_vals[i] <- rnorm(1, 0, 0.01) + sin((dataset[i, 1] + 3*dataset[i, 4] + dataset[i, 5])/1000 + 0.45) #true score comes from here - this direction times x
+  }
+  dataset$y_vals <- y_vals
+  return(dataset)
+}
+true_B <- c(1,0,0,3,1)/50
+
+test_data_cos <- x_gen(200, 5) %>% y_gen_cos()
+
+true_score <- as.matrix(test_data_cos[,-6]) %*% true_B
+
+data_cos_SIRed <- sir_all(test_data_cos, directions = 3, slices = 10, categorical = FALSE, y = "y_vals")
+
+cor(data_cos_SIRed[,1], true_score)
+
+pc_cos <- prcomp(test_data_cos[,-6])$x
+
+cor(pc_cos[,1], true_score)
+
+plot(data_cos_SIRed[,1], test_data_cos$y_vals)
+
+plot(pc_cos[,1], test_data_cos$y_vals)
+```
+
+## Y Binary
+
+Not binary, but discretises continuous x values into y = c(1,2,3,4). Performs the same task as binary but better.
+
+The better performance here can be seen in the fact that we have less overlap between the x values of the y categories. In the true function, the lowest x values are given y = 0, the next x values are given y = 1, and so on. The SIR DR preserves that relationship better than the PCA DR.
+
+```{r}
+y_bin <- function(dataset) {
+  nc <- ncol(dataset)
+  nr <- nrow(dataset)
+  y_vals <- rep(0, nr)
+  for (i in 1:nr) {
+    value <- rnorm(1, 0, 0.001) + sin((dataset[i, 1] + 3*dataset[i, 4] + dataset[i, 5])/50)
+    if (value > 0.4) {
+      y_vals[i] <- 3
+    } else if ((value <= 0.4) & (value > 0)) {
+      y_vals[i] <- 2
+    } else if ((value <= 0) & (value > -0.4)) {
+      y_vals[i] <- 1
+    } else {
+      y_vals[i] <- 0
+    }
+  }
+  dataset$y_vals <- factor(y_vals)
+  return(dataset)
+}
+
+# discrete formula: 
+# 1) randomly generate X
+# 2) create value = sin(XB)
+# 3) 
+
+bin_dataset <- x_gen(n = 1000, p = 5) %>% y_bin
+bin_dataset
+
+bin_x <- bin_dataset %>% dplyr::select(-c(y_vals))
+bin_y <- bin_dataset %>% dplyr::select(c(y_vals))
+bin_x
+bin_y
+bin_sired <- univariate_sir(bin_x, Y = bin_y, slices = 10, directions = 3)
+
+plot(bin_sired[[1]][,1], bin_dataset$y_vals)
+
+pc <- prcomp(bin_dataset[,-6])$x
+plot(pc[,1], bin_dataset$y_vals)
+
+discrete_for_plot <- matrix(NA, nrow = 2000, ncol = 3) %>% as.data.frame()
+colnames(discrete_for_plot) <- c("y_vals", "method", "z_val")
+discrete_for_plot$y_vals <- rep(bin_dataset$y_vals, 2)
+discrete_for_plot$method <- c(rep("PCA", 1000), rep("SIR", 1000))
+discrete_for_plot$z_val <- c(pc[,1], bin_sired[[1]][,1]*100)
+ggplot(discrete_for_plot, aes(x = z_val, y = y_vals)) +
+  geom_point(col = "#e64626") +
+  facet_wrap(~method, scales = "free") +
+  labs(x = "First Direction of Z", y = "True Y Values") +
+  ggtitle("First Direction of Z from PCA, SIR DR against True Y Values") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+
+bin_dr_onj <- dr(y_vals ~ var1 + var2 + var3 + var4 + var5, data = bin_dataset, method = "sir", numdir = 5, nslices = 4)
+bin_dr_onj$slice.info
+
+Y_bin <- as.data.frame(bin_dataset[,6])
+X_bin <- bin_dataset[,1:5]
+my_sir_bin_obj <- categorical_sir(X = X_bin, Y = Y_bin, directions = 5)
+
+
+plot(scale(bin_dr_onj$evectors[,1])[1:5], col = "red")
+points(scale(my_sir_bin_obj[[2]][,1])[1:5], col = "blue")
+
+bin_dr_onj$evectors[,1]/sqrt(sum(bin_dr_onj$evectors[,1]^2))
+my_sir_bin_obj[[2]][,1]/sqrt(sum(my_sir_bin_obj[[2]][,1]^2))
+```
+
+# Comparison between .R function and dr package
+
+```{r}
+dr_obj <- dr(formula = y~var1+var2+var3+var4+var5, data = test_data, method = "sir", nslices = 10, numdir = 4) %>% summary
+dr_obj
+sir_obj <- univariate_sir(X = test_data[,-6], Y = as.data.frame(test_data[,6]), directions = 4, slices = 10)[[1]]
+
+plot(sir_obj[,1], test_data$y)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
